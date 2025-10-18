@@ -257,6 +257,8 @@ class get_TSS_count():
                     with open(outpath, 'wb') as f:
                         pickle.dump(reslsSec, f)
 
+        print('Reassemble altTSSdict from disk')
+
         # Reassemble altTSSdict from disk
         altTSSdict = {}
         for geneid in readls:
@@ -266,7 +268,11 @@ class get_TSS_count():
                     res = pickle.load(f)
                     if res:
                         altTSSdict[geneid] = res
-
+                    # Delete temp file after loading
+                    os.remove(cluster_file)
+                    
+        print('Saving altTSSdict to disk')
+        
         tss_output = self.count_out_dir + 'before_cluster_peak.pkl'
         with open(tss_output, 'wb') as f:
             pickle.dump(altTSSdict, f)
