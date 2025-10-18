@@ -231,51 +231,47 @@ class get_TSS_count():
 
 
     def _do_hierarchial_cluster(self):
-        start_time=time.time()
+        import os, pickle, time
+        start_time = time.time()
+
         fetch_path = self.count_out_dir + 'fetch_reads.pkl'
-        
         if os.path.exists(fetch_path):
             print("Resuming from existing fetch_reads.pkl...")
             with open(fetch_path, 'rb') as f:
                 readinfodict = pickle.load(f)
         else:
-            print("Fetching reads...")
             readinfodict = self._get_gene_reads()
 
-        pool = multiprocessing.Pool(processes=self.nproc)
-        
-        #print(len(readinfodict))
+        readls = list(readinfodict.keys())
+        dictcontentls = [readinfodict[i] for i in readls]
 
-        altTSSdict={}
-        altTSSls=[]
-        dictcontentls=[]
-        readls=list(readinfodict.keys())
-        #print(len(readls))
-        #print('unique gene id %i'%(len(set(readls))))
-        for i in readls:
-            dictcontentls.append(readinfodict[i])
+        cluster_dir = os.path.join(self.count_out_dir, 'cluster_results')
+        os.makedirs(cluster_dir, exist_ok=True)
 
-        #print(inputpar[0])
-        #print(len(dictcontentls))
-
-        print("Begin clustering...")
-
-
+        print(f"Clustering {len(readls)} genes with {self.nproc} processes...")
 
         with multiprocessing.Pool(self.nproc) as pool:
-            altTSSls=pool.map_async(self._do_clustering,dictcontentls).get()
+            for geneid, reslsSec in zip(readls, pool.imap_unordered(self._do_clustering, dictcontentls)):
+                if reslsSec:
+                    outpath = os.path.join(cluster_dir, f"{geneid}.pkl")
+                    with open(outpath, 'wb') as f:
+                        pickle.dump(reslsSec, f)
 
+        # Reassemble altTSSdict from disk
+        altTSSdict = {}
+        for geneid in readls:
+            cluster_file = os.path.join(cluster_dir, f"{geneid}.pkl")
+            if os.path.exists(cluster_file):
+                with open(cluster_file, 'rb') as f:
+                    res = pickle.load(f)
+                    if res:
+                        altTSSdict[geneid] = res
 
+        tss_output = self.count_out_dir + 'before_cluster_peak.pkl'
+        with open(tss_output, 'wb') as f:
+            pickle.dump(altTSSdict, f)
 
-        for geneidSec, reslsSec in zip(readls,altTSSls):
-            altTSSdict[geneidSec]=reslsSec
-        altTSSdict={k: v for k, v in altTSSdict.items() if v}
-
-        tss_output=self.count_out_dir+'before_cluster_peak.pkl'
-        with open(tss_output,'wb') as f:
-            pickle.dump(altTSSdict,f)
-
-        print('do clustering Time elapsed',int(time.time()-start_time),'seconds.')
+        print('do clustering Time elapsed', int(time.time() - start_time), 'seconds.')
 
         return altTSSdict
 
