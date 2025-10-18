@@ -232,9 +232,18 @@ class get_TSS_count():
 
     def _do_hierarchial_cluster(self):
         start_time=time.time()
+        fetch_path = self.count_out_dir + 'fetch_reads.pkl'
+        
+        if os.path.exists(fetch_path):
+            print("Resuming from existing fetch_reads.pkl...")
+            with open(fetch_path, 'rb') as f:
+                readinfodict = pickle.load(f)
+        else:
+            print("Fetching reads...")
+            readinfodict = self._get_gene_reads()
 
         pool = multiprocessing.Pool(processes=self.nproc)
-        readinfodict=self._get_gene_reads() 
+        
         #print(len(readinfodict))
 
         altTSSdict={}
@@ -249,7 +258,7 @@ class get_TSS_count():
         #print(inputpar[0])
         #print(len(dictcontentls))
 
-        #print(len(inputpar))
+        print("Begin clustering...")
 
 
 
@@ -278,6 +287,7 @@ class get_TSS_count():
         #get testX
         ## get RNA-seq X
         #make a new dictionary
+        print("Filtering...")
         clusterdict={}
         for i in altTSSdict.keys():
             for j in range(0,len(altTSSdict[i])):
@@ -344,8 +354,9 @@ class get_TSS_count():
                 index=afterfiltereddf.loc[j]['NO.TSS']
                 keeptranscriptls.append(altTSSdict[i][index])
             keepdict[i]=keeptranscriptls
+            
 
-
+        print("Finished filtering, saveing keepdict.pkl...")
 
         tss_output=self.count_out_dir+'keepdict.pkl'
         with open(tss_output,'wb') as f:
