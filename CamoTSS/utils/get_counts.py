@@ -186,52 +186,102 @@ class get_TSS_count():
 
 
 
-    def _do_clustering(self,args):
-        #geneid=success[0]
-        geneid, readinfo = args
-        MAX_CLUSTER_READS = 10000
-        if len(readinfo) > MAX_CLUSTER_READS:
+    def _do_clustering(self, args):
+        # geneid=success[0]
+        geneid, readinfo_full = args
+        MAX_CLUSTER_READS = 20000
+    
+        # Track whether downsampling occurred
+        downsampled = False
+        if len(readinfo_full) > MAX_CLUSTER_READS:
             import logging
-            logging.warning(f"Downsampling gene {geneid} from {len(readinfo)} to {MAX_CLUSTER_READS} reads")
-            idx = np.random.choice(len(readinfo), MAX_CLUSTER_READS, replace=False)
-            readinfo = [readinfo[i] for i in idx]
-
-        # do hierarchical cluster
-        clusterModel = AgglomerativeClustering(n_clusters=None,linkage='average',distance_threshold=self.InnerDistance)
-
-        posiarray=np.array([t[0] for t in readinfo]).reshape(-1,1)
-
-        #print(posiarray.shape)
-
-        CBarray=np.array([t[1] for t in readinfo]).reshape(-1,1)
-        cigartuplearray=np.array([t[2] for t in readinfo]).reshape(-1,1)
-        #seqarray=np.array([t[3] for t in readinfodict[geneid]]).reshape(-1,1)  #have more opportunity that this step has question
-        clusterModel=clusterModel.fit(posiarray)
-
-        #print('finish clustering fit')
-
-        labels=clusterModel.labels_
-        label,count=np.unique(labels,return_counts=True)
-
-        #print('finish label unique')
-        selectlabel=label[count>=self.minCount]
-        selectcount=count[count>=self.minCount]
-        #finalcount=list(selectcount[np.argsort(selectcount)[::-1]])
-        finallabel=list(selectlabel[np.argsort(selectcount)[::-1]])
-
-        #print(finallabel)
-
-        #after adding 
-        #numlabel=len(finallabel)    
-
-        altTSSls=[]
-        #if len(finallabel)>=2:
-        for i in range(0,len(finallabel)):
-            altTSSls.append([posiarray[labels==finallabel[i]],CBarray[labels==finallabel[i]],cigartuplearray[labels==finallabel[i]]])
+            logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
         
-        #print(altTSSls)
-                       
+            # Step 1: Group reads by dataset ID
+            from collections import defaultdict
+            dataset_groups = defaultdict(list)
+            for read in readinfo_full:
+                barcode = read[1]
+                if '-' in barcode:
+                    dataset_id = barcode.split('-')[-1]
+                else:
+                    dataset_id = 'UNKNOWN'
+                dataset_groups[dataset_id].append(read)
+        
+            # Step 2: Determine sample size per dataset
+            num_datasets = len(dataset_groups)
+            reads_per_dataset = MAX_CLUSTER_READS // num_datasets
+        
+            # Step 3: Sample evenly from each dataset
+            readinfo_sample = []
+            for dsid, reads in dataset_groups.items():
+                if len(reads) <= reads_per_dataset:
+                    readinfo_sample.extend(reads)
+                else:
+                    sampled = np.random.choice(len(reads), reads_per_dataset, replace=False)
+                    readinfo_sample.extend([reads[i] for i in sampled])
+        
+            # Step 4: Track leftovers
+            sampled_set = set(tuple(r) for r in readinfo_sample)
+            readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
+            downsampled = True
+        else:
+            readinfo_sample = readinfo_full
+            readinfo_leftover = []
+            downsampled = False
+    
+        # --- Clustering on sample ---
+        clusterModel = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
+    
+        posi_sample = np.array([t[0] for t in readinfo_sample]).reshape(-1, 1)
+        CB_sample = np.array([t[1] for t in readinfo_sample]).reshape(-1, 1)
+        cigar_sample = np.array([t[2] for t in readinfo_sample]).reshape(-1, 1)
+    
+        clusterModel = clusterModel.fit(posi_sample)
+        labels_sample = clusterModel.labels_
+    
+        # --- Build initial clusters ---
+        unique_labels = np.unique(labels_sample)
+        altTSSls_raw = []
+        for lbl in unique_labels:
+            altTSSls_raw.append([
+                posi_sample[labels_sample == lbl],
+                CB_sample[labels_sample == lbl],
+                cigar_sample[labels_sample == lbl]
+            ])
+    
+        # --- Assign leftover reads to nearest cluster ---
+        if downsampled and len(altTSSls_raw) > 0 and len(readinfo_leftover) > 0:
+            from sklearn.neighbors import NearestNeighbors
+    
+            # Compute centroids from sample clusters
+            centroids = np.array([
+                cluster[0].mean() for cluster in altTSSls_raw
+            ]).reshape(-1, 1)
+    
+            # Prepare leftover read arrays
+            posi_left = np.array([t[0] for t in readinfo_leftover]).reshape(-1, 1)
+            CB_left = np.array([t[1] for t in readinfo_leftover]).reshape(-1, 1)
+            cigar_left = np.array([t[2] for t in readinfo_leftover]).reshape(-1, 1)
+    
+            # Assign each leftover read to nearest centroid
+            nn = NearestNeighbors(n_neighbors=1).fit(centroids)
+            assigned = nn.kneighbors(posi_left, return_distance=False).flatten()
+    
+            # Append leftover reads to corresponding clusters
+            for i, lbl_idx in enumerate(assigned):
+                altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_left[i]))
+                altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_left[i]))
+                altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_left[i]))
+    
+        # --- Filter clusters by minCount AFTER merging ---
+        altTSSls = []
+        for cluster in altTSSls_raw:
+            if cluster[0].shape[0] >= self.minCount:
+                altTSSls.append(cluster)
+    
         return altTSSls
+
 
 
 
