@@ -184,10 +184,7 @@ class get_TSS_count():
         return readinfodict
 
 
-
-
     def _do_clustering(self, args):
-        # geneid=success[0]
         geneid, readinfo_full = args
         MAX_CLUSTER_READS = 20000
     
@@ -195,32 +192,35 @@ class get_TSS_count():
         downsampled = False
         if len(readinfo_full) > MAX_CLUSTER_READS:
             import logging
-            logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
-        
-            # Step 1: Group reads by dataset ID
             from collections import defaultdict
-            dataset_groups = defaultdict(list)
+            logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
+    
+            # Step 1: Group reads by condition and replicate
+            condition_groups = defaultdict(lambda: defaultdict(list))
             for read in readinfo_full:
                 barcode = read[1]
-                if '-' in barcode:
-                    dataset_id = barcode.split('-')[-1]
-                else:
-                    dataset_id = 'UNKNOWN'
-                dataset_groups[dataset_id].append(read)
-        
-            # Step 2: Determine sample size per dataset
-            num_datasets = len(dataset_groups)
-            reads_per_dataset = MAX_CLUSTER_READS // num_datasets
-        
-            # Step 3: Sample evenly from each dataset
+                suffix = barcode.split('-')[-1] if '-' in barcode else 'UNKNOWN'
+                condition = suffix.split('_')[0]  # Extract condition before underscore
+                condition_groups[condition][suffix].append(read)
+    
+            # Step 2: Determine sample size per condition
+            num_conditions = len(condition_groups)
+            reads_per_condition = MAX_CLUSTER_READS // num_conditions
+    
+            # Step 3: Sample evenly across replicates within each condition
             readinfo_sample = []
-            for dsid, reads in dataset_groups.items():
-                if len(reads) <= reads_per_dataset:
-                    readinfo_sample.extend(reads)
-                else:
-                    sampled = np.random.choice(len(reads), reads_per_dataset, replace=False)
-                    readinfo_sample.extend([reads[i] for i in sampled])
-        
+            for condition, replicates in condition_groups.items():
+                num_replicates = len(replicates)
+                reads_per_replicate = reads_per_condition // num_replicates
+                for replicate_id, reads in replicates.items():
+                    if len(reads) <= reads_per_replicate:
+                        readinfo_sample.extend(reads)
+                        logging.warning(f"Gene {geneid}: using all {len(reads)} reads from replicate {replicate_id} (condition {condition})")
+                    else:
+                        sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
+                        readinfo_sample.extend([reads[i] for i in sampled])
+                        logging.warning(f"Gene {geneid}: sampled {reads_per_replicate} reads from replicate {replicate_id} (condition {condition})")
+    
             # Step 4: Track leftovers
             sampled_set = set(tuple(r) for r in readinfo_sample)
             readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
