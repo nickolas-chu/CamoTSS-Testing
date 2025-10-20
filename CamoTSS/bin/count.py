@@ -9,7 +9,7 @@ import os
 import pandas as pd
 import time 
 
-import logging  # <-- Add this
+import logging
 
 # Configure logging before anything else
 logging.basicConfig(
