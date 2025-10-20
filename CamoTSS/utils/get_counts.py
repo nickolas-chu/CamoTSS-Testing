@@ -186,9 +186,15 @@ class get_TSS_count():
 
 
 
-    def _do_clustering(self,dictcontentls):
+    def _do_clustering(self,args):
         #geneid=success[0]
-        readinfo=dictcontentls
+        geneid, readinfo = args
+        MAX_CLUSTER_READS = 10000
+        if len(readinfo) > MAX_CLUSTER_READS:
+            import logging
+            logging.warning(f"Downsampling gene {geneid} from {len(readinfo)} to {MAX_CLUSTER_READS} reads")
+            idx = np.random.choice(len(readinfo), MAX_CLUSTER_READS, replace=False)
+            readinfo = [readinfo[i] for i in idx]
 
         # do hierarchical cluster
         clusterModel = AgglomerativeClustering(n_clusters=None,linkage='average',distance_threshold=self.InnerDistance)
@@ -242,7 +248,7 @@ class get_TSS_count():
             readinfodict = self._get_gene_reads()
 
         readls = list(readinfodict.keys())
-        dictcontentls = [readinfodict[i] for i in readls]
+    
 
         cluster_dir = os.path.join(self.count_out_dir, 'cluster_results')
         os.makedirs(cluster_dir, exist_ok=True)
@@ -254,10 +260,10 @@ class get_TSS_count():
         from multiprocessing import get_context
         for i in range(0, len(readls), batch_size):
             batch = readls[i:i+batch_size]
-            dictcontentls = [readinfodict[gid] for gid in batch]
 
             with get_context("spawn").Pool(self.nproc) as pool:
-                for geneid, reslsSec in zip(batch, pool.imap_unordered(self._do_clustering, dictcontentls)):
+                args = [(gid, readinfodict[gid]) for gid in batch]
+                for geneid, reslsSec in zip(batch, pool.imap_unordered(self._do_clustering, args)):
                     if reslsSec:
                         outpath = os.path.join(cluster_dir, f"{geneid}.pkl")
                         with open(outpath, 'wb') as f:
