@@ -16,6 +16,7 @@ import editdistance
 import warnings
 from pathlib import Path
 from .toolbox import check_pysam_chrom,fetch_reads
+from multiprocessing import get_context
 
 
 
