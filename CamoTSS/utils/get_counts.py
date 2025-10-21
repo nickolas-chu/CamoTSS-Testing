@@ -195,7 +195,6 @@ class get_TSS_count():
         # Track whether downsampling occurred
         downsampled = False
         if len(readinfo_full) > MAX_CLUSTER_READS:
-            import logging
             from collections import defaultdict
             logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
     
