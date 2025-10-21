@@ -235,7 +235,7 @@ class get_TSS_count():
                     sampled_set = set(tuple(r) for r in readinfo_sample)
                 except Exception as e: 
                     logging.error(f"Gene {geneid} failed during tuple conversion: {type(e).__name__}: {e}")
-                return (geneid, None)
+                    return (geneid, None)
 
                     
                 readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
