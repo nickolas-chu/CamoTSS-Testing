@@ -231,8 +231,13 @@ class get_TSS_count():
                             sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
                             readinfo_sample.extend([reads[i] for i in sampled])
                             logging.warning(f"Gene {geneid}: sampled {reads_per_replicate} reads from replicate {replicate_id} (condition {condition})")
-    
-                sampled_set = set(tuple(r) for r in readinfo_sample)
+                try:
+                    sampled_set = set(tuple(r) for r in readinfo_sample)
+                except Exception as e: 
+                    logging.error(f"Gene {geneid} failed during tuple conversion: {type(e).__name__}: {e}")
+                return (geneid, None)
+
+                    
                 readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
                 downsampled = True
             else:
@@ -325,7 +330,7 @@ class get_TSS_count():
             for future in as_completed(futures):
                 geneid = futures[future]
                 try:
-                    geneid, reslsSec = future.result(timeout=600)
+                    geneid, reslsSec = future.result()
                     if reslsSec:
                         altTSSdict[geneid] = reslsSec
                     else:
