@@ -313,7 +313,7 @@ class get_TSS_count():
 
             with get_context("spawn").Pool(self.nproc) as pool:
                 args = [(gid, readinfodict[gid]) for gid in batch]
-                for geneid, reslsSec in zip(batch, pool.imap_unordered(self._do_clustering, args)):
+                for geneid, reslsSec in zip(batch, pool.imap_unordered(self._do_clustering, args, chunksize=1)):
                     if reslsSec:
                         outpath = os.path.join(cluster_dir, f"{geneid}.pkl")
                         with open(outpath, 'wb') as f:
