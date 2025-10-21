@@ -280,15 +280,16 @@ class get_TSS_count():
             if cluster[0].shape[0] >= self.minCount:
                 altTSSls.append(cluster)
     
-        return altTSSls
+        return (geneid, altTSSls)
 
 
 
 
     def _do_hierarchial_cluster(self):
-        #import os, pickle, time
+        
         start_time = time.time()
-
+        last_save_time = start_time
+    
         fetch_path = self.count_out_dir + 'fetch_reads.pkl'
         if os.path.exists(fetch_path):
             print("Resuming from existing fetch_reads.pkl...")
@@ -296,49 +297,35 @@ class get_TSS_count():
                 readinfodict = pickle.load(f)
         else:
             readinfodict = self._get_gene_reads()
-
-        readls = list(readinfodict.keys())
     
-
-        cluster_dir = os.path.join(self.count_out_dir, 'cluster_results')
-        os.makedirs(cluster_dir, exist_ok=True)
-
+        readls = list(readinfodict.keys())
         print(f"Clustering {len(readls)} genes with {self.nproc} processes...")
-        batch_size = 1000  # Tune based on disk capacity and result size
+    
         altTSSdict = {}
-
-        from multiprocessing import get_context
-        for i in range(0, len(readls), batch_size):
-            batch = readls[i:i+batch_size]
-
-            with get_context("spawn").Pool(self.nproc) as pool:
-                args = [(gid, readinfodict[gid]) for gid in batch]
-                for geneid, reslsSec in zip(batch, pool.imap_unordered(self._do_clustering, args, chunksize=1)):
-                    if reslsSec:
-                        outpath = os.path.join(cluster_dir, f"{geneid}.pkl")
-                        with open(outpath, 'wb') as f:
-                            pickle.dump(reslsSec, f)
-
-            # Reassemble and delete batch
-            for geneid in batch:
-                cluster_file = os.path.join(cluster_dir, f"{geneid}.pkl")
-                if os.path.exists(cluster_file):
-                    with open(cluster_file, 'rb') as f:
-                        res = pickle.load(f)
-                    if res:
-                        altTSSdict[geneid] = res
-                    os.remove(cluster_file)
-
-
-        print('Saving altTSSdict to disk')
-
-        tss_output = self.count_out_dir + 'before_cluster_peak.pkl'
+        args = [(gid, readinfodict[gid]) for gid in readls]
+    
+        with get_context("spawn").Pool(self.nproc) as pool:
+            for geneid, reslsSec in pool.imap_unordered(self._do_clustering, args, chunksize=1):
+                if reslsSec:
+                    altTSSdict[geneid] = reslsSec
+    
+                # Save intermediate results every hour
+                current_time = time.time()
+                if current_time - last_save_time >= 3600:
+                    checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
+                    with open(checkpoint_path, 'wb') as f:
+                        pickle.dump(altTSSdict, f)
+                    print(f"Checkpoint saved at {int((current_time - start_time) / 60)} min")
+                    last_save_time = current_time
+    
+        # Final save
+        tss_output = os.path.join(self.count_out_dir, 'before_cluster_peak.pkl')
         with open(tss_output, 'wb') as f:
             pickle.dump(altTSSdict, f)
-
+    
         print('do clustering Time elapsed', int(time.time() - start_time), 'seconds.')
-
         return altTSSdict
+
 
 
     def _filter_false_positive(self):
