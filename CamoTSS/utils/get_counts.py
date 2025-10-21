@@ -18,6 +18,11 @@ from pathlib import Path
 from .toolbox import check_pysam_chrom,fetch_reads
 from multiprocessing import get_context
 import logging
+import signal
+
+class TimeoutException(Exception):
+    pass
+
 
 
 
@@ -192,99 +197,94 @@ class get_TSS_count():
         logging.warning(f"Starting clustering for {geneid}")
         MAX_CLUSTER_READS = 20000
     
-        # Track whether downsampling occurred
-        downsampled = False
-        if len(readinfo_full) > MAX_CLUSTER_READS:
-            from collections import defaultdict
-            logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
+        # Set a hard timeout
+        def handler(signum, frame):
+            raise TimeoutException("Clustering timed out")
     
-            # Step 1: Group reads by condition and replicate
-            condition_groups = defaultdict(lambda: defaultdict(list))
-            for read in readinfo_full:
-                barcode = read[1]
-                suffix = barcode.split('-')[-1] if '-' in barcode else 'UNKNOWN'
-                condition = suffix.split('_')[0]  # Extract condition before underscore
-                condition_groups[condition][suffix].append(read)
+        signal.signal(signal.SIGALRM, handler)
+        signal.alarm(600)  # 10-minute timeout
     
-            # Step 2: Determine sample size per condition
-            num_conditions = len(condition_groups)
-            reads_per_condition = MAX_CLUSTER_READS // num_conditions
-    
-            # Step 3: Sample evenly across replicates within each condition
-            readinfo_sample = []
-            for condition, replicates in condition_groups.items():
-                num_replicates = len(replicates)
-                reads_per_replicate = reads_per_condition // num_replicates
-                for replicate_id, reads in replicates.items():
-                    if len(reads) <= reads_per_replicate:
-                        readinfo_sample.extend(reads)
-                        logging.warning(f"Gene {geneid}: using all {len(reads)} reads from replicate {replicate_id} (condition {condition})")
-                    else:
-                        sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
-                        readinfo_sample.extend([reads[i] for i in sampled])
-                        logging.warning(f"Gene {geneid}: sampled {reads_per_replicate} reads from replicate {replicate_id} (condition {condition})")
-    
-            # Step 4: Track leftovers
-            sampled_set = set(tuple(r) for r in readinfo_sample)
-            readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
-            downsampled = True
-        else:
-            readinfo_sample = readinfo_full
-            readinfo_leftover = []
+        try:
+            # --- Downsampling logic ---
             downsampled = False
+            if len(readinfo_full) > MAX_CLUSTER_READS:
+                from collections import defaultdict
+                logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
+                condition_groups = defaultdict(lambda: defaultdict(list))
+                for read in readinfo_full:
+                    barcode = read[1]
+                    suffix = barcode.split('-')[-1] if '-' in barcode else 'UNKNOWN'
+                    condition = suffix.split('_')[0]
+                    condition_groups[condition][suffix].append(read)
     
-        # --- Clustering on sample ---
-        clusterModel = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
+                num_conditions = len(condition_groups)
+                reads_per_condition = MAX_CLUSTER_READS // num_conditions
+                readinfo_sample = []
+                for condition, replicates in condition_groups.items():
+                    num_replicates = len(replicates)
+                    reads_per_replicate = reads_per_condition // num_replicates
+                    for replicate_id, reads in replicates.items():
+                        if len(reads) <= reads_per_replicate:
+                            readinfo_sample.extend(reads)
+                            logging.warning(f"Gene {geneid}: using all {len(reads)} reads from replicate {replicate_id} (condition {condition})")
+                        else:
+                            sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
+                            readinfo_sample.extend([reads[i] for i in sampled])
+                            logging.warning(f"Gene {geneid}: sampled {reads_per_replicate} reads from replicate {replicate_id} (condition {condition})")
     
-        posi_sample = np.array([t[0] for t in readinfo_sample]).reshape(-1, 1)
-        CB_sample = np.array([t[1] for t in readinfo_sample]).reshape(-1, 1)
-        cigar_sample = np.array([t[2] for t in readinfo_sample]).reshape(-1, 1)
+                sampled_set = set(tuple(r) for r in readinfo_sample)
+                readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
+                downsampled = True
+            else:
+                readinfo_sample = readinfo_full
+                readinfo_leftover = []
     
-        clusterModel = clusterModel.fit(posi_sample)
-        labels_sample = clusterModel.labels_
+            # --- Clustering ---
+            clusterModel = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
+            posi_sample = np.array([t[0] for t in readinfo_sample]).reshape(-1, 1)
+            CB_sample = np.array([t[1] for t in readinfo_sample]).reshape(-1, 1)
+            cigar_sample = np.array([t[2] for t in readinfo_sample]).reshape(-1, 1)
     
-        # --- Build initial clusters ---
-        unique_labels = np.unique(labels_sample)
-        altTSSls_raw = []
-        for lbl in unique_labels:
-            altTSSls_raw.append([
-                posi_sample[labels_sample == lbl],
-                CB_sample[labels_sample == lbl],
-                cigar_sample[labels_sample == lbl]
-            ])
+            clusterModel = clusterModel.fit(posi_sample)
+            labels_sample = clusterModel.labels_
     
-        # --- Assign leftover reads to nearest cluster ---
-        if downsampled and len(altTSSls_raw) > 0 and len(readinfo_leftover) > 0:
-            from sklearn.neighbors import NearestNeighbors
+            altTSSls_raw = []
+            for lbl in np.unique(labels_sample):
+                altTSSls_raw.append([
+                    posi_sample[labels_sample == lbl],
+                    CB_sample[labels_sample == lbl],
+                    cigar_sample[labels_sample == lbl]
+                ])
     
-            # Compute centroids from sample clusters
-            centroids = np.array([
-                cluster[0].mean() for cluster in altTSSls_raw
-            ]).reshape(-1, 1)
+            if downsampled and altTSSls_raw and readinfo_leftover:
+                from sklearn.neighbors import NearestNeighbors
+                centroids = np.array([cluster[0].mean() for cluster in altTSSls_raw]).reshape(-1, 1)
+                posi_left = np.array([t[0] for t in readinfo_leftover]).reshape(-1, 1)
+                CB_left = np.array([t[1] for t in readinfo_leftover]).reshape(-1, 1)
+                cigar_left = np.array([t[2] for t in readinfo_leftover]).reshape(-1, 1)
     
-            # Prepare leftover read arrays
-            posi_left = np.array([t[0] for t in readinfo_leftover]).reshape(-1, 1)
-            CB_left = np.array([t[1] for t in readinfo_leftover]).reshape(-1, 1)
-            cigar_left = np.array([t[2] for t in readinfo_leftover]).reshape(-1, 1)
+                nn = NearestNeighbors(n_neighbors=1).fit(centroids)
+                assigned = nn.kneighbors(posi_left, return_distance=False).flatten()
     
-            # Assign each leftover read to nearest centroid
-            nn = NearestNeighbors(n_neighbors=1).fit(centroids)
-            assigned = nn.kneighbors(posi_left, return_distance=False).flatten()
+                for i, lbl_idx in enumerate(assigned):
+                    altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_left[i]))
+                    altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_left[i]))
+                    altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_left[i]))
     
-            # Append leftover reads to corresponding clusters
-            for i, lbl_idx in enumerate(assigned):
-                altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_left[i]))
-                altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_left[i]))
-                altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_left[i]))
+            altTSSls = [cluster for cluster in altTSSls_raw if cluster[0].shape[0] >= self.minCount]
     
-        # --- Filter clusters by minCount AFTER merging ---
-        altTSSls = []
-        for cluster in altTSSls_raw:
-            if cluster[0].shape[0] >= self.minCount:
-                altTSSls.append(cluster)
-                
-        logging.warning(f"Finished clustering for {geneid}")
-        return (geneid, altTSSls)
+            signal.alarm(0)  # Cancel alarm
+            logging.warning(f"Finished clustering for {geneid}")
+            return (geneid, altTSSls)
+    
+        except TimeoutException:
+            logging.error(f"TIMEOUT: Gene {geneid} exceeded 600s")
+            return (geneid, None)
+    
+        except Exception as e:
+            logging.error(f"FAILED: Gene {geneid} - {type(e).__name__}: {e}")
+            return (geneid, None)
+
 
 
 
@@ -310,18 +310,14 @@ class get_TSS_count():
                 altTSSdict = pickle.load(f)
         else:
             altTSSdict = {}
+            
         readls = list(readinfodict.keys())
         args = [(gid, readinfodict[gid]) for gid in readls if gid not in altTSSdict]
         skipped_genes = [gid for gid in readls if gid in altTSSdict]
         logging.warning(f"Skipping {len(skipped_genes)} genes already clustered.")
         print(f"Clustering {len(args)} genes with {self.nproc} processes...")
     
-        #altTSSdict = {}
-        #args = [(gid, readinfodict[gid]) for gid in readls]
-        #with get_context("spawn").Pool(self.nproc) as pool:
-            #for geneid, reslsSec in pool.imap_unordered(self._do_clustering, args, chunksize=1):
-                #if reslsSec:
-                    #altTSSdict[geneid] = reslsSec
+
         from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=self.nproc) as executor:
             futures = {executor.submit(self._do_clustering, arg): arg[0] for arg in args}
@@ -332,9 +328,14 @@ class get_TSS_count():
                     geneid, reslsSec = future.result(timeout=600)
                     if reslsSec:
                         altTSSdict[geneid] = reslsSec
+                    else:
+                        logging.warning(f"Gene {geneid} returned no results (timeout or clustering failure)")
+                        failed_genes.append(geneid)
+                        
                 except Exception as e:
-                    logging.warning(f"Gene {geneid} failed: {e}")
+                    logging.error(f"Gene {geneid} crashed: {type(e).__name__}: {e}")
                     failed_genes.append(geneid)
+                    
                 # Save intermediate results every hour
                 current_time = time.time()
                 if current_time - last_save_time >= 3600:
