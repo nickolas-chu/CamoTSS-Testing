@@ -187,6 +187,7 @@ class get_TSS_count():
 
     def _do_clustering(self, args):
         geneid, readinfo_full = args
+        logging.warning(f"Starting clustering for {geneid}")
         MAX_CLUSTER_READS = 20000
     
         # Track whether downsampling occurred
@@ -280,7 +281,8 @@ class get_TSS_count():
         for cluster in altTSSls_raw:
             if cluster[0].shape[0] >= self.minCount:
                 altTSSls.append(cluster)
-    
+                
+        logging.warning(f"Finished clustering for {geneid}")
         return (geneid, altTSSls)
 
 
@@ -290,6 +292,7 @@ class get_TSS_count():
         
         start_time = time.time()
         last_save_time = start_time
+        failed_genes = []
     
         fetch_path = self.count_out_dir + 'fetch_reads.pkl'
         if os.path.exists(fetch_path):
@@ -298,18 +301,39 @@ class get_TSS_count():
                 readinfodict = pickle.load(f)
         else:
             readinfodict = self._get_gene_reads()
-    
+
+        checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
+        if os.path.exists(checkpoint_path):
+            print("Resuming from existing altTSSdict_hourly.pkl...")
+            with open(checkpoint_path, 'rb') as f:
+                altTSSdict = pickle.load(f)
+        else:
+            altTSSdict = {}
         readls = list(readinfodict.keys())
-        print(f"Clustering {len(readls)} genes with {self.nproc} processes...")
+        args = [(gid, readinfodict[gid]) for gid in readls if gid not in altTSSdict]
+        skipped_genes = [gid for gid in readls if gid in altTSSdict]
+        logging.warning(f"Skipping {len(skipped_genes)} genes already clustered.")
+        print(f"Clustering {len(args)} genes with {self.nproc} processes...")
     
-        altTSSdict = {}
-        args = [(gid, readinfodict[gid]) for gid in readls]
-    
-        with get_context("spawn").Pool(self.nproc) as pool:
-            for geneid, reslsSec in pool.imap_unordered(self._do_clustering, args, chunksize=1):
-                if reslsSec:
-                    altTSSdict[geneid] = reslsSec
-    
+        #altTSSdict = {}
+        #args = [(gid, readinfodict[gid]) for gid in readls]
+        #with get_context("spawn").Pool(self.nproc) as pool:
+            #for geneid, reslsSec in pool.imap_unordered(self._do_clustering, args, chunksize=1):
+                #if reslsSec:
+                    #altTSSdict[geneid] = reslsSec
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=self.nproc) as executor:
+            futures = {executor.submit(self._do_clustering, arg): arg[0] for arg in args}
+        
+            for future in as_completed(futures):
+                geneid = futures[future]
+                try:
+                    geneid, reslsSec = future.result(timeout=600)
+                    if reslsSec:
+                        altTSSdict[geneid] = reslsSec
+                except Exception as e:
+                    logging.warning(f"Gene {geneid} failed: {e}")
+                    failed_genes.append(geneid)
                 # Save intermediate results every hour
                 current_time = time.time()
                 if current_time - last_save_time >= 3600:
@@ -325,6 +349,17 @@ class get_TSS_count():
             pickle.dump(altTSSdict, f)
     
         print('do clustering Time elapsed', int(time.time() - start_time), 'seconds.')
+
+        if failed_genes:
+            logging.warning(f"Clustering failed for {len(failed_genes)} genes:")
+            for gid in failed_genes:
+                logging.warning(f"  - {gid}")
+            print("Clustering halted due to failed genes. See log.txt for details.")
+            with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
+                f.write('\n'.join(failed_genes))
+
+            sys.exit(1)
+                                                    
         return altTSSdict
 
 
