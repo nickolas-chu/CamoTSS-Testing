@@ -192,6 +192,24 @@ class get_TSS_count():
 
 
         return readinfodict
+    
+    
+    def _cluster_chunk(self, chunk):
+        posi = np.array([r[0] for r in chunk]).reshape(-1, 1)
+        CB = np.array([r[1] for r in chunk]).reshape(-1, 1)
+        cigar = np.array([r[2] for r in chunk]).reshape(-1, 1)
+    
+        model = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
+        labels = model.fit(posi).labels_
+    
+        clusters = []
+        for lbl in np.unique(labels):
+            clusters.append([
+                posi[labels == lbl],
+                CB[labels == lbl],
+                cigar[labels == lbl]
+            ])
+        return clusters
 
 
     def _do_clustering(self, args):
@@ -249,25 +267,10 @@ class get_TSS_count():
             CHUNK_SIZE = 20000
             chunks = [readinfo_sorted[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_sorted), CHUNK_SIZE)]
     
-            def cluster_chunk(chunk):
-                posi = np.array([r[0] for r in chunk]).reshape(-1, 1)
-                CB = np.array([r[1] for r in chunk]).reshape(-1, 1)
-                cigar = np.array([r[2] for r in chunk]).reshape(-1, 1)
-    
-                model = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
-                labels = model.fit(posi).labels_
-    
-                clusters = []
-                for lbl in np.unique(labels):
-                    clusters.append([
-                        posi[labels == lbl],
-                        CB[labels == lbl],
-                        cigar[labels == lbl]
-                    ])
-                return clusters
-    
+
             with Pool(processes=min(self.nproc, len(chunks))) as pool:
-                chunked_clusters = pool.map(cluster_chunk, chunks)
+                chunked_clusters = pool.map(self._cluster_chunk, chunks)
+
     
             # --- Flatten clusters ---
             altTSSls_raw = [cluster for sublist in chunked_clusters for cluster in sublist]
@@ -321,13 +324,20 @@ class get_TSS_count():
         else:
             readinfodict = self._get_gene_reads()
 
-        checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
-        if os.path.exists(checkpoint_path):
-            print("Resuming from existing altTSSdict_hourly.pkl...")
-            with open(checkpoint_path, 'rb') as f:
+        # Try resuming from before_cluster_peak.pkl first, then altTSSdict_hourly.pkl
+        altTSSdict = {}
+        peak_path = os.path.join(self.count_out_dir, 'before_cluster_peak.pkl')
+        hourly_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
+        
+        if os.path.exists(peak_path):
+            print("Resuming from before_cluster_peak.pkl...")
+            with open(peak_path, 'rb') as f:
                 altTSSdict = pickle.load(f)
-        else:
-            altTSSdict = {}
+        elif os.path.exists(hourly_path):
+            print("Resuming from altTSSdict_hourly.pkl...")
+            with open(hourly_path, 'rb') as f:
+                altTSSdict = pickle.load(f)
+
             
         readls = list(readinfodict.keys())
         args = [(gid, readinfodict[gid]) for gid in readls if gid not in altTSSdict]
