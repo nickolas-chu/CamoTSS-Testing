@@ -19,7 +19,7 @@ from .toolbox import check_pysam_chrom,fetch_reads
 from multiprocessing import get_context
 import logging
 import signal
-
+import sys
 class TimeoutException(Exception):
     pass
 
@@ -279,6 +279,9 @@ class get_TSS_count():
             altTSSls = [cluster for cluster in altTSSls_raw if cluster[0].shape[0] >= self.minCount]
     
             signal.alarm(0)  # Cancel alarm
+            logging.warning(f"Gene {geneid}: readinfo_sample size = {len(readinfo_sample)}")
+            logging.warning(f"Gene {geneid}: posi_sample shape = {posi_sample.shape}")
+            logging.warning(f"Gene {geneid}: {len(altTSSls_raw)} raw clusters → {len(altTSSls)} after minCount={self.minCount}")
             logging.warning(f"Finished clustering for {geneid}")
             return (geneid, altTSSls)
     
@@ -292,6 +295,78 @@ class get_TSS_count():
 
 
 
+    def _do_clustering_heavy(self, args):
+        import numpy as np
+        from sklearn.cluster import AgglomerativeClustering
+        from sklearn.neighbors import NearestNeighbors
+        from multiprocessing import Pool
+        import logging
+    
+        geneid, readinfo_full = args
+        logging.warning(f"[HEAVY] Starting heavy clustering for {geneid} with {len(readinfo_full)} reads")
+    
+        try:
+            # --- Sort reads by genomic position ---
+            readinfo_sorted = sorted(readinfo_full, key=lambda r: r[0])
+    
+            # --- Chunking logic ---
+            CHUNK_SIZE = 50000
+            chunks = [readinfo_sorted[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_sorted), CHUNK_SIZE)]
+    
+            def cluster_chunk(chunk):
+                posi = np.array([r[0] for r in chunk]).reshape(-1, 1)
+                CB = np.array([r[1] for r in chunk]).reshape(-1, 1)
+                cigar = np.array([r[2] for r in chunk]).reshape(-1, 1)
+    
+                model = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
+                labels = model.fit(posi).labels_
+    
+                clusters = []
+                for lbl in np.unique(labels):
+                    clusters.append([
+                        posi[labels == lbl],
+                        CB[labels == lbl],
+                        cigar[labels == lbl]
+                    ])
+                return clusters
+    
+            with Pool(processes=min(self.nproc, len(chunks))) as pool:
+                chunked_clusters = pool.map(cluster_chunk, chunks)
+    
+            # --- Flatten clusters ---
+            altTSSls_raw = [cluster for sublist in chunked_clusters for cluster in sublist]
+    
+            # --- Merge clusters that are close ---
+            if len(altTSSls_raw) > 1:
+                centroids = np.array([c[0].mean() for c in altTSSls_raw]).reshape(-1, 1)
+                nn = NearestNeighbors(n_neighbors=1).fit(centroids)
+                merged = []
+                used = set()
+    
+                for i, c1 in enumerate(altTSSls_raw):
+                    if i in used:
+                        continue
+                    merged_cluster = [c1[0], c1[1], c1[2]]
+                    for j in range(i + 1, len(altTSSls_raw)):
+                        if j in used:
+                            continue
+                        dist = np.abs(c1[0].mean() - altTSSls_raw[j][0].mean())
+                        if dist < self.InnerDistance:
+                            merged_cluster[0] = np.vstack((merged_cluster[0], altTSSls_raw[j][0]))
+                            merged_cluster[1] = np.vstack((merged_cluster[1], altTSSls_raw[j][1]))
+                            merged_cluster[2] = np.vstack((merged_cluster[2], altTSSls_raw[j][2]))
+                            used.add(j)
+                    merged.append(merged_cluster)
+                altTSSls_raw = merged
+    
+            # --- Filter clusters by minCount ---
+            altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
+            logging.warning(f"[HEAVY] Gene {geneid}: {len(altTSSls_raw)} raw clusters → {len(altTSSls)} after minCount={self.minCount}")
+            return (geneid, altTSSls)
+    
+        except Exception as e:
+            logging.error(f"[HEAVY] FAILED: Gene {geneid} - {type(e).__name__}: {e}")
+            return (geneid, None)
 
 
     def _do_hierarchial_cluster(self):
@@ -331,11 +406,14 @@ class get_TSS_count():
                 geneid = futures[future]
                 try:
                     geneid, reslsSec = future.result()
-                    if reslsSec:
+                    if reslsSec is not None:
                         altTSSdict[geneid] = reslsSec
+                        if not reslsSec:
+                            logging.warning(f"Gene {geneid} clustered but returned no valid TSSs (all clusters < minCount)")
                     else:
-                        logging.warning(f"Gene {geneid} returned no results (timeout or clustering failure)")
+                        logging.warning(f"Gene {geneid} failed (timeout or exception)")
                         failed_genes.append(geneid)
+
                         
                 except Exception as e:
                     logging.error(f"Gene {geneid} crashed: {type(e).__name__}: {e}")
@@ -364,9 +442,42 @@ class get_TSS_count():
             print("Clustering halted due to failed genes. See log.txt for details.")
             with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
                 f.write('\n'.join(failed_genes))
+                
+            # --- Retry large genes with multi-core clustering ---
+            large_genes = [gid for gid in failed_genes if len(readinfodict.get(gid, [])) > 1_000_000]
+            if large_genes:
+                print(f"Retrying {len(large_genes)} large genes with multi-core clustering...")
+                args_large = [(gid, readinfodict[gid]) for gid in large_genes]
 
-            sys.exit(1)
-                                                    
+                from multiprocessing import Pool
+                with Pool(processes=self.nproc) as pool:
+                    results = pool.map(self._do_clustering_heavy, args_large)
+
+                recovered = 0
+                for geneid, res in results:
+                    if res is not None:
+                        altTSSdict[geneid] = res
+                        recovered += 1
+                        failed_genes.remove(geneid)
+                        logging.warning(f"Recovered large gene {geneid}")
+                print(f"Recovered {recovered} large genes with multi-core clustering.")
+
+            # Save updated failed gene list
+            with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
+                f.write('\n'.join(failed_genes))
+
+            if failed_genes:
+                logging.warning(f"Still failed after recovery: {len(failed_genes)} genes")
+                for gid in failed_genes:
+                    logging.warning(f"  - {gid}")
+                print("Clustering halted due to unrecoverable genes. See log.txt for details.")
+                sys.exit(1)
+                
+        if recovered > 0:
+            recovery_checkpoint = os.path.join(self.count_out_dir, 'altTSSdict_after_large.pkl')
+            with open(recovery_checkpoint, 'wb') as f:
+                pickle.dump(altTSSdict, f)
+                                        
         return altTSSdict
 
 
