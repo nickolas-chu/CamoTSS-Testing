@@ -390,9 +390,10 @@ class get_TSS_count():
                 print(f"Retrying {len(large_genes)} large genes with multi-core clustering...")
                 args_large = [(gid, readinfodict[gid]) for gid in large_genes]
 
-                from multiprocessing import Pool
-                with Pool(processes=self.nproc) as pool:
-                    results = pool.map(self._do_clustering_heavy, args_large)
+                results = []
+                for arg in args_large:
+                    results.append(self._do_clustering_heavy(arg))
+
 
                 for geneid, res in results:
                     if res is not None:
