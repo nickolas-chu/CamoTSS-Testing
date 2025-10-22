@@ -20,6 +20,8 @@ from multiprocessing import get_context
 import logging
 import signal
 import sys
+from sklearn.neighbors import NearestNeighbors
+from multiprocessing import Pool
 class TimeoutException(Exception):
     pass
 
@@ -262,7 +264,6 @@ class get_TSS_count():
                 ])
     
             if downsampled and altTSSls_raw and readinfo_leftover:
-                from sklearn.neighbors import NearestNeighbors
                 centroids = np.array([cluster[0].mean() for cluster in altTSSls_raw]).reshape(-1, 1)
                 posi_left = np.array([t[0] for t in readinfo_leftover]).reshape(-1, 1)
                 CB_left = np.array([t[1] for t in readinfo_leftover]).reshape(-1, 1)
@@ -296,11 +297,7 @@ class get_TSS_count():
 
 
     def _do_clustering_heavy(self, args):
-        import numpy as np
-        from sklearn.cluster import AgglomerativeClustering
-        from sklearn.neighbors import NearestNeighbors
-        from multiprocessing import Pool
-        import logging
+
     
         geneid, readinfo_full = args
         logging.warning(f"[HEAVY] Starting heavy clustering for {geneid} with {len(readinfo_full)} reads")
