@@ -403,17 +403,26 @@ class get_TSS_count():
                 print(f"Retrying {len(large_genes)} large genes with multi-core clustering...")
                 args_large = [(gid, readinfodict[gid]) for gid in large_genes]
 
-                results = []
-                for arg in args_large:
-                    results.append(self._do_clustering_heavy(arg))
-
-
-                for geneid, res in results:
+                last_save_time_large = time.time()
+                
+                for i, arg in enumerate(args_large):
+                    geneid, res = self._do_clustering_heavy(arg)
+                
                     if res is not None:
                         altTSSdict[geneid] = res
                         recovered += 1
                         failed_genes.remove(geneid)
                         logging.warning(f"Recovered large gene {geneid}")
+                
+                    # Hourly checkpoint during large gene recovery
+                    current_time = time.time()
+                    if current_time - last_save_time_large >= 3600:
+                        checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
+                        with open(checkpoint_path, 'wb') as f:
+                            pickle.dump(altTSSdict, f)
+                        logging.warning(f"[HEAVY] Checkpoint saved to altTSSdict_hourly.pkl at {int((current_time - start_time) / 60)} min")
+                        last_save_time_large = current_time
+                
                 print(f"Recovered {recovered} large genes with multi-core clustering.")
 
             # Save updated failed gene list
