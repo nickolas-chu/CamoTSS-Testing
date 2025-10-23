@@ -405,7 +405,7 @@ class get_TSS_count():
 
                 last_save_time_large = time.time()
                 
-                for i, arg in enumerate(args_large):
+                for i, arg in args_large:
                     geneid, res = self._do_clustering_heavy(arg)
                 
                     if res is not None:
