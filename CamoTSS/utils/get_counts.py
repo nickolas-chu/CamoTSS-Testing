@@ -354,6 +354,8 @@ class get_TSS_count():
                 geneid = futures[future]
                 try:
                     geneid, reslsSec = future.result()
+                    futures.pop(future)
+                    
                     if reslsSec is not None:
                         altTSSdict[geneid] = reslsSec
                         if not reslsSec:
@@ -364,6 +366,7 @@ class get_TSS_count():
 
                         
                 except Exception as e:
+                    futures.pop(future)
                     logging.error(f"Gene {geneid} crashed: {type(e).__name__}: {e}")
                     failed_genes.append(geneid)
                     
@@ -373,7 +376,7 @@ class get_TSS_count():
                     checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
                     with open(checkpoint_path, 'wb') as f:
                         pickle.dump(altTSSdict, f)
-                    print(f"Checkpoint saved at {int((current_time - start_time) / 60)} min")
+                    logging.warning(f"Checkpoint saved to altTSSdict_hourly.pkl at {int((current_time - start_time) / 60)} min")
                     last_save_time = current_time
     
         # Save before attempting large genes
