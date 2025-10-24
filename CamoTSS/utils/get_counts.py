@@ -471,6 +471,7 @@ class get_TSS_count():
             if os.path.exists(failed_genes_path):
                 with open(failed_genes_path, 'r') as f:
                     failed_genes = f.read().splitlines()
+                    logging.warning(f"[RECOVERY] Attempting to re-cluster {len(failed_genes)} failed genes using chunked multiprocessing.")
             else:
                 failed_genes = []
 
