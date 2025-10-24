@@ -42,7 +42,20 @@ def get_fastq_file(fastqFilePath):
     fastqFile=pysam.FastaFile(fastqFilePath)
     return fastqFile
 
-
+    
+def _assign_leftover_chunk_bounded(chunk, cluster_bounds, cluster_centroids):
+    results = []
+    for read in chunk:
+        read_pos = read[0]
+        eligible = [
+            (idx, abs(read_pos - cluster_centroids[idx]))
+            for idx, (min_, max_) in enumerate(cluster_bounds)
+            if min_ <= read_pos <= max_
+        ]
+        if eligible:
+            best_cluster = min(eligible, key=lambda x: x[1])[0]
+            results.append((read, best_cluster))
+    return results
 
 
 class get_TSS_count():
@@ -218,21 +231,6 @@ class get_TSS_count():
         assigned = nn.kneighbors(chunk, return_distance=False).flatten()
         return assigned
 
-
-    
-    def _assign_leftover_chunk_bounded(chunk, cluster_bounds, cluster_centroids):
-        results = []
-        for read in chunk:
-            read_pos = read[0]
-            eligible = [
-                (idx, abs(read_pos - cluster_centroids[idx]))
-                for idx, (min_, max_) in enumerate(cluster_bounds)
-                if min_ <= read_pos <= max_
-            ]
-            if eligible:
-                best_cluster = min(eligible, key=lambda x: x[1])[0]
-                results.append((read, best_cluster))
-        return results
 
     def _do_clustering(self, args):
         geneid, readinfo_full = args
