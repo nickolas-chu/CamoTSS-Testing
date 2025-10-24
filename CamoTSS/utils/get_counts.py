@@ -518,13 +518,13 @@ class get_TSS_count():
         with open(tss_output, 'wb') as f:
             pickle.dump(altTSSdict, f)
     
-        print('do clustering Time elapsed', int(time.time() - start_time), 'seconds.')
+        logging.warning(f'do clustering Time elapsed', {int(time.time() - start_time)} 'seconds.')
 
         if failed_genes:
             logging.warning(f"Clustering failed for {len(failed_genes)} genes:")
             for gid in failed_genes:
                 logging.warning(f"  - {gid}")
-            print("Clustering halted due to failed genes. See log.txt for details.")
+            logging.warning("Clustering halted due to failed genes. See log.txt for details.")
             with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
                 f.write('\n'.join(failed_genes))
 
