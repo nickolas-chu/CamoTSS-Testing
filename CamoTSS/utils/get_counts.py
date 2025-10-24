@@ -519,33 +519,57 @@ class get_TSS_count():
 
         # Try resuming from before_cluster_peak.pkl first, then altTSSdict_hourly.pkl
         altTSSdict = {}
-        peak_path = os.path.join(self.count_out_dir, 'before_cluster_peak.pkl') 
+        recovery_hourly_path = os.path.join(self.count_out_dir, 'altTSSdict_recovery_hourly.pkl')
+        peak_path = os.path.join(self.count_out_dir, 'before_cluster_peak.pkl')
         hourly_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
-
-        #before_cluster_peak.pkl present indicates smaller genes already clustered and should be skipped
-        if os.path.exists(peak_path):
-            print("Resuming from before_cluster_peak.pkl...")
-            with open(peak_path, 'rb') as f:
+        
+        # --- Priority: resume from recovery checkpoint if present ---
+        if os.path.exists(recovery_hourly_path):
+            print("Resuming from altTSSdict_recovery_hourly.pkl...")
+            with open(recovery_hourly_path, 'rb') as f:
                 altTSSdict = pickle.load(f)
-             # Skip clustering, go straight to recovery
+        
             failed_genes_path = os.path.join(self.count_out_dir, 'failed_genes.txt')
             if os.path.exists(failed_genes_path):
                 with open(failed_genes_path, 'r') as f:
                     failed_genes = f.read().splitlines()
-                    logging.warning(f"[RECOVERY] Attempting to re-cluster {len(failed_genes)} failed genes using chunked multiprocessing.")
-            #If missing failed_genes file, need to recreate. failed_genes are those present in  readinfodict, but not in altTSSdict  
+                logging.warning(f"[RECOVERY] Attempting to re-cluster {len(failed_genes)} failed genes using chunked multiprocessing.")
             else:
                 failed_genes = [gid for gid in readinfodict if gid not in altTSSdict]
                 logging.warning(f"[RECOVERY] Reconstructed {len(failed_genes)} failed genes from readinfodict and altTSSdict.")
-                
+        
             altTSSdict = self._recover_failed_genes_parallel(failed_genes, readinfodict, altTSSdict)
+        
             # Final save
-            tss_output = os.path.join(self.count_out_dir, 'before_cluster_peak_Final.pkl')
-            with open(tss_output, 'wb') as f:
+            final_path = os.path.join(self.count_out_dir, 'before_cluster_peak_Final.pkl')
+            with open(final_path, 'wb') as f:
                 pickle.dump(altTSSdict, f)
-                            
+            logging.warning("[RECOVERY] Final clustering results saved to before_cluster_peak_Final.pkl.")
             return altTSSdict
-            
+        
+        # --- Otherwise resume from before_cluster_peak.pkl ---
+        elif os.path.exists(peak_path):
+            print("Resuming from before_cluster_peak.pkl...")
+            with open(peak_path, 'rb') as f:
+                altTSSdict = pickle.load(f)
+        
+            failed_genes_path = os.path.join(self.count_out_dir, 'failed_genes.txt')
+            if os.path.exists(failed_genes_path):
+                with open(failed_genes_path, 'r') as f:
+                    failed_genes = f.read().splitlines()
+                logging.warning(f"[RECOVERY] Attempting to re-cluster {len(failed_genes)} failed genes using chunked multiprocessing.")
+            else:
+                failed_genes = [gid for gid in readinfodict if gid not in altTSSdict]
+                logging.warning(f"[RECOVERY] Reconstructed {len(failed_genes)} failed genes from readinfodict and altTSSdict.")
+        
+            altTSSdict = self._recover_failed_genes_parallel(failed_genes, readinfodict, altTSSdict)
+        
+            final_path = os.path.join(self.count_out_dir, 'before_cluster_peak_Final.pkl')
+            with open(final_path, 'wb') as f:
+                pickle.dump(altTSSdict, f)
+            logging.warning("[RECOVERY] Final clustering results saved to before_cluster_peak_Final.pkl.")
+            return altTSSdict
+
         #otherwise start clustering from a checkpoint or from the begining        
         elif os.path.exists(hourly_path):
             print("Resuming from altTSSdict_hourly.pkl...")
