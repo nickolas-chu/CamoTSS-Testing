@@ -22,7 +22,7 @@ import signal
 import sys
 from sklearn.neighbors import NearestNeighbors
 from multiprocessing import Pool
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
+from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
 class TimeoutException(Exception):
     pass
 
@@ -528,7 +528,7 @@ class get_TSS_count():
         print(f"Clustering {len(args)} genes with {self.nproc} processes...")
     
 
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        
         with ProcessPoolExecutor(max_workers=self.nproc) as executor:
             futures = {executor.submit(self._do_clustering, arg): arg[0] for arg in args}
         
