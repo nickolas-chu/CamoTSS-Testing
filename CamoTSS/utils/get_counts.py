@@ -10,7 +10,6 @@ from sklearn.cluster import AgglomerativeClustering
 from scipy.optimize import linear_sum_assignment
 import time
 import random
-import pickle
 import statistics
 import editdistance
 import warnings
