@@ -467,6 +467,54 @@ class get_TSS_count():
             print("Resuming from before_cluster_peak.pkl...")
             with open(peak_path, 'rb') as f:
                 altTSSdict = pickle.load(f)
+             # Skip clustering, go straight to recovery
+            failed_genes_path = os.path.join(self.count_out_dir, 'failed_genes.txt')
+            if os.path.exists(failed_genes_path):
+                with open(failed_genes_path, 'r') as f:
+                    failed_genes = f.read().splitlines()
+            else:
+                failed_genes = []
+
+            # Recovery block starts here
+            recovered = 0
+            for geneid in failed_genes[:]: 
+                readinfo = readinfodict.get(geneid)
+                if not readinfo:
+                    logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
+                    continue
+                with ProcessPoolExecutor(max_workers=1) as recovery_executor:
+                    future = recovery_executor.submit(self._do_clustering_heavy, (geneid, readinfo))
+                    try:
+                        geneid, res = future.result(timeout=600)  # 10-minute timeout
+                        if res is not None:
+                            altTSSdict[geneid] = res
+                            recovered += 1
+                            failed_genes.remove(geneid)
+                            logging.warning(f"[RECOVERY] Successfully clustered {geneid} with chunked multiprocessing.")
+                        else:
+                            logging.warning(f"[RECOVERY] Gene {geneid} still failed after chunked retry.")
+                    except TimeoutError:
+                        logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s during heavy clustering.")
+
+            # Save updated results after recovery
+            with open(os.path.join(self.count_out_dir, 'altTSSdict_after_recovery.pkl'), 'wb') as f:
+                pickle.dump(altTSSdict, f)
+            
+            # Save updated failed gene list
+            with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
+                f.write('\n'.join(failed_genes))
+            
+            if failed_genes:
+                logging.warning(f"Still failed after recovery: {len(failed_genes)} genes")
+                for gid in failed_genes:
+                    logging.warning(f"  - {gid}")
+                print("Clustering halted due to unrecoverable genes. See log.txt for details.")
+                sys.exit(1)
+            else:
+                logging.warning(f"Recovered {recovered} genes using chunked multiprocessing.")
+                                        
+            return altTSSdict
+        #otherwise start clustering from a checkpoint or from the begining        
         elif os.path.exists(hourly_path):
             print("Resuming from altTSSdict_hourly.pkl...")
             with open(hourly_path, 'rb') as f:
@@ -518,7 +566,7 @@ class get_TSS_count():
         with open(tss_output, 'wb') as f:
             pickle.dump(altTSSdict, f)
     
-        logging.warning(f'do clustering Time elapsed', {int(time.time() - start_time)} 'seconds.')
+        logging.warning(f"do clustering Time elapsed, {int(time.time() - start_time)} seconds.")
 
         if failed_genes:
             logging.warning(f"Clustering failed for {len(failed_genes)} genes:")
