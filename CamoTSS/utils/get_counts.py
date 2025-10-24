@@ -476,6 +476,8 @@ class get_TSS_count():
 
             # Recovery block starts here
             recovered = 0
+            recovery_start_time = time.time()
+            last_recovery_save_time = recovery_start_time
             for geneid in failed_genes[:]: 
                 readinfo = readinfodict.get(geneid)
                 if not readinfo:
@@ -494,6 +496,16 @@ class get_TSS_count():
                             logging.warning(f"[RECOVERY] Gene {geneid} still failed after chunked retry.")
                     except TimeoutError:
                         logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s during heavy clustering.")
+
+                current_time = time.time()
+                if current_time - last_recovery_save_time >= 3600:
+                    checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_recovery_hourly.pkl')
+                    with open(checkpoint_path, 'wb') as f:
+                        pickle.dump(altTSSdict, f)
+                    with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
+                        f.write('\n'.join(failed_genes))
+                    logging.warning(f"[RECOVERY] Checkpoint saved to altTSSdict_recovery_hourly.pkl at {int((current_time - recovery_start_time) / 60)} min")
+                    last_recovery_save_time = current_time
 
             # Save updated results after recovery
             with open(os.path.join(self.count_out_dir, 'altTSSdict_after_recovery.pkl'), 'wb') as f:
@@ -577,6 +589,9 @@ class get_TSS_count():
 
             # --- Retry failed genes one-by-one using chunked multiprocessing ---
             recovered = 0
+            recovery_start_time = time.time()
+            last_recovery_save_time = recovery_start_time
+
             for geneid in failed_genes[:]:  # iterate over a copy since we may modify the list
                 readinfo = readinfodict.get(geneid)
                 if not readinfo:
@@ -596,6 +611,17 @@ class get_TSS_count():
                             logging.warning(f"[RECOVERY] Gene {geneid} still failed after chunked retry.")
                     except TimeoutError:
                         logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s during heavy clustering.")
+
+                current_time = time.time()
+                if current_time - last_recovery_save_time >= 3600:
+                    checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_recovery_hourly.pkl')
+                    with open(checkpoint_path, 'wb') as f:
+                        pickle.dump(altTSSdict, f)
+                    with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
+                        f.write('\n'.join(failed_genes))
+                    logging.warning(f"[RECOVERY] Checkpoint saved to altTSSdict_recovery_hourly.pkl at {int((current_time - recovery_start_time) / 60)} min")
+                    last_recovery_save_time = current_time
+
 
             # Save updated results after recovery
             with open(os.path.join(self.count_out_dir, 'altTSSdict_after_recovery.pkl'), 'wb') as f:
