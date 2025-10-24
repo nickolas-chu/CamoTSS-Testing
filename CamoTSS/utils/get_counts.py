@@ -219,6 +219,21 @@ class get_TSS_count():
         return assigned
 
 
+    
+    def _assign_leftover_chunk_bounded(chunk, cluster_bounds, cluster_centroids):
+        results = []
+        for read in chunk:
+            read_pos = read[0]
+            eligible = [
+                (idx, abs(read_pos - cluster_centroids[idx]))
+                for idx, (min_, max_) in enumerate(cluster_bounds)
+                if min_ <= read_pos <= max_
+            ]
+            if eligible:
+                best_cluster = min(eligible, key=lambda x: x[1])[0]
+                results.append((read, best_cluster))
+        return results
+
     def _do_clustering(self, args):
         geneid, readinfo_full = args
         logging.warning(f"Starting clustering for {geneid}")
@@ -292,20 +307,38 @@ class get_TSS_count():
     
             # --- Assign leftover reads to nearest cluster ---
             if downsampled and len(altTSSls_raw) > 0 and len(readinfo_leftover) > 0:
-                from sklearn.neighbors import NearestNeighbors
     
-                centroids = np.array([cluster[0].mean() for cluster in altTSSls_raw]).reshape(-1, 1)
-                posi_left = np.array([t[0] for t in readinfo_leftover]).reshape(-1, 1)
-                CB_left = np.array([t[1] for t in readinfo_leftover]).reshape(-1, 1)
-                cigar_left = np.array([t[2] for t in readinfo_leftover]).reshape(-1, 1)
-    
-                nn = NearestNeighbors(n_neighbors=1).fit(centroids)
-                assigned = nn.kneighbors(posi_left, return_distance=False).flatten()
-    
-                for i, lbl_idx in enumerate(assigned):
-                    altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_left[i]))
-                    altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_left[i]))
-                    altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_left[i]))
+                # Compute cluster bounds
+                cluster_bounds = []
+                for cluster in altTSSls_raw:
+                    positions = cluster[0].flatten()
+                    cluster_min = np.min(positions)
+                    cluster_max = np.max(positions)
+                    cluster_bounds.append((cluster_min, cluster_max))
+                
+                # Prepare leftover reads
+                filtered_reads = []
+                for read in readinfo_leftover:
+                    read_pos = read[0]
+                    eligible_clusters = [
+                        idx for idx, (min_, max_) in enumerate(cluster_bounds)
+                        if min_ <= read_pos <= max_
+                    ]
+                    if eligible_clusters:
+                        # Assign to the closest eligible cluster by centroid
+                        centroid_dists = [
+                            (idx, abs(read_pos - altTSSls_raw[idx][0].mean()))
+                            for idx in eligible_clusters
+                        ]
+                        best_cluster = min(centroid_dists, key=lambda x: x[1])[0]
+                        filtered_reads.append((read, best_cluster))
+                
+                # Assign reads
+                for read, lbl_idx in filtered_reads:
+                    altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
+                    altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
+                    altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
+
     
             # --- Filter clusters by minCount ---
             altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
@@ -381,25 +414,28 @@ class get_TSS_count():
     
             # --- Assign leftover reads using multiprocessing ---
             if downsampled and len(altTSSls_raw) > 0 and len(readinfo_leftover) > 0:
-                centroids = np.array([cluster[0].mean() for cluster in altTSSls_raw]).reshape(-1, 1)
-                posi_left = np.array([t[0] for t in readinfo_leftover]).reshape(-1, 1)
-                CB_left = np.array([t[1] for t in readinfo_leftover]).reshape(-1, 1)
-                cigar_left = np.array([t[2] for t in readinfo_leftover]).reshape(-1, 1)
+                cluster_bounds = []
+                cluster_centroids = []
+                for cluster in altTSSls_raw:
+                    positions = cluster[0].flatten()
+                    cluster_bounds.append((np.min(positions), np.max(positions)))
+                    cluster_centroids.append(np.mean(positions))
     
                 CHUNK_SIZE = 5000
-                chunks = [posi_left[i:i + CHUNK_SIZE] for i in range(0, len(posi_left), CHUNK_SIZE)]
+                chunks = [readinfo_leftover[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_leftover), CHUNK_SIZE)]
     
-                from multiprocessing import Pool
+
                 with Pool(processes=min(self.nproc, len(chunks))) as pool:
-                    assigned_chunks = pool.starmap(_assign_leftover_chunk, [(chunk, centroids) for chunk in chunks])
+                    assigned_chunks = pool.starmap(
+                        _assign_leftover_chunk_bounded,
+                        [(chunk, cluster_bounds, cluster_centroids) for chunk in chunks]
+                    )
     
-                assigned = np.concatenate(assigned_chunks)
-    
-                for i, lbl_idx in enumerate(assigned):
-                    altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_left[i]))
-                    altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_left[i]))
-                    altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_left[i]))
-    
+                for chunk in assigned_chunks:
+                    for read, lbl_idx in chunk:
+                        altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
+                        altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
+                        altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
             # --- Filter clusters by minCount ---
             altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
             logging.warning(f"[HEAVY] Gene {geneid}: {len(altTSSls_raw)} raw clusters → {len(altTSSls)} after minCount={self.minCount}")
