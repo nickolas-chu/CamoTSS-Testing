@@ -351,7 +351,7 @@ class get_TSS_count():
             return (geneid, None)
 
 
-    def _do_clustering_heavy(self, args):
+    def _do_clustering_heavy(self, args, chunk_nproc):
         geneid, readinfo_full = args
         logging.warning(f"[HEAVY] Starting heavy clustering for {geneid} with {len(readinfo_full)} reads")
     
@@ -422,7 +422,7 @@ class get_TSS_count():
                 chunks = [readinfo_leftover[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_leftover), CHUNK_SIZE)]
     
 
-                with Pool(processes=min(self.nproc, len(chunks))) as pool:
+                with get_context("spawn").Pool(processes=min(chunk_nproc, len(chunks))) as pool:
                     assigned_chunks = pool.starmap(
                         _assign_leftover_chunk_bounded,
                         [(chunk, cluster_bounds, cluster_centroids) for chunk in chunks]
@@ -433,6 +433,7 @@ class get_TSS_count():
                         altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
                         altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
                         altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
+                        
             # --- Filter clusters by minCount ---
             altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
             logging.warning(f"[HEAVY] Gene {geneid}: {len(altTSSls_raw)} raw clusters → {len(altTSSls)} after minCount={self.minCount}")
@@ -442,13 +443,72 @@ class get_TSS_count():
             logging.error(f"[HEAVY] FAILED: Gene {geneid} - {type(e).__name__}: {e}")
             return (geneid, None)
 
- 
+
+
+    def _recover_failed_genes_parallel(self, failed_genes, readinfodict, altTSSdict):
+        recovered = 0
+        gene_nproc = 5  # Always process 5 genes at a time
+        total_cores = self.nproc  
+        chunk_nproc = max(1, (total_cores - gene_nproc) // gene_nproc)
+
+        recovery_start_time = time.time()
+        last_recovery_save_time = recovery_start_time
+    
+        args = [(geneid, readinfodict.get(geneid)) for geneid in failed_genes if readinfodict.get(geneid)]
+        skipped = [geneid for geneid in failed_genes if not readinfodict.get(geneid)]
+        for geneid in skipped:
+            logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
+    
+        with ProcessPoolExecutor(max_workers=gene_nproc) as executor:
+            futures = {executor.submit(self._do_clustering_heavy, arg, chunk_nproc): arg[0] for arg in args}
+            for future in as_completed(futures):
+                geneid = futures[future]
+                try:
+                    geneid, res = future.result(timeout=600)
+                    if res is not None:
+                        altTSSdict[geneid] = res
+                        recovered += 1
+                        failed_genes.remove(geneid)
+                        logging.warning(f"[RECOVERY] Successfully clustered {geneid}.")
+                    else:
+                        logging.warning(f"[RECOVERY] Gene {geneid} still failed after retry.")
+                except TimeoutError:
+                    logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s.")
+    
+                current_time = time.time()
+                if current_time - last_recovery_save_time >= 3600:
+                    self._save_recovery_checkpoint(altTSSdict, failed_genes)
+                    last_recovery_save_time = current_time
+    
+        self._save_recovery_checkpoint(altTSSdict, failed_genes, final=True)
+    
+        if failed_genes:
+            logging.warning(f"Still failed after recovery: {len(failed_genes)} genes")
+            for gid in failed_genes:
+                logging.warning(f"  - {gid}")
+            print("Clustering halted due to unrecoverable genes. See log.txt for details.")
+            sys.exit(1)
+        else:
+            logging.warning(f"Recovered {recovered} genes using parallel recovery.")
+    
+        return altTSSdict
+
+    def _save_recovery_checkpoint(self, altTSSdict, failed_genes, final=False):
+        suffix = 'after_recovery' if final else 'recovery_hourly'
+        with open(os.path.join(self.count_out_dir, f'altTSSdict_{suffix}.pkl'), 'wb') as f:
+            pickle.dump(altTSSdict, f)
+        with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
+            f.write('\n'.join(failed_genes))
+        if not final:
+            logging.warning(f"[RECOVERY] Checkpoint saved to altTSSdict_recovery_hourly.pkl")
+
     def _do_hierarchial_cluster(self):
         
         start_time = time.time()
         last_save_time = start_time
         failed_genes = []
-    
+        
+        # First get all reads for all genes, either load previously saved reads or get from BAM
         fetch_path = self.count_out_dir + 'fetch_reads.pkl'
         if os.path.exists(fetch_path):
             print("Resuming from existing fetch_reads.pkl...")
@@ -459,9 +519,10 @@ class get_TSS_count():
 
         # Try resuming from before_cluster_peak.pkl first, then altTSSdict_hourly.pkl
         altTSSdict = {}
-        peak_path = os.path.join(self.count_out_dir, 'before_cluster_peak.pkl')
+        peak_path = os.path.join(self.count_out_dir, 'before_cluster_peak.pkl') 
         hourly_path = os.path.join(self.count_out_dir, 'altTSSdict_hourly.pkl')
-        
+
+        #before_cluster_peak.pkl present indicates smaller genes already clustered and should be skipped
         if os.path.exists(peak_path):
             print("Resuming from before_cluster_peak.pkl...")
             with open(peak_path, 'rb') as f:
@@ -472,75 +533,31 @@ class get_TSS_count():
                 with open(failed_genes_path, 'r') as f:
                     failed_genes = f.read().splitlines()
                     logging.warning(f"[RECOVERY] Attempting to re-cluster {len(failed_genes)} failed genes using chunked multiprocessing.")
+            #If missing failed_genes file, need to recreate. failed_genes are those present in  readinfodict, but not in altTSSdict  
             else:
-                failed_genes = []
-
-            # Recovery block starts here
-            recovered = 0
-            recovery_start_time = time.time()
-            last_recovery_save_time = recovery_start_time
-            for geneid in failed_genes[:]: 
-                readinfo = readinfodict.get(geneid)
-                if not readinfo:
-                    logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
-                    continue
-                with ProcessPoolExecutor(max_workers=1) as recovery_executor:
-                    future = recovery_executor.submit(self._do_clustering_heavy, (geneid, readinfo))
-                    try:
-                        geneid, res = future.result(timeout=600)  # 10-minute timeout
-                        if res is not None:
-                            altTSSdict[geneid] = res
-                            recovered += 1
-                            failed_genes.remove(geneid)
-                            logging.warning(f"[RECOVERY] Successfully clustered {geneid} with chunked multiprocessing.")
-                        else:
-                            logging.warning(f"[RECOVERY] Gene {geneid} still failed after chunked retry.")
-                    except TimeoutError:
-                        logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s during heavy clustering.")
-
-                current_time = time.time()
-                if current_time - last_recovery_save_time >= 3600:
-                    checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_recovery_hourly.pkl')
-                    with open(checkpoint_path, 'wb') as f:
-                        pickle.dump(altTSSdict, f)
-                    with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
-                        f.write('\n'.join(failed_genes))
-                    logging.warning(f"[RECOVERY] Checkpoint saved to altTSSdict_recovery_hourly.pkl at {int((current_time - recovery_start_time) / 60)} min")
-                    last_recovery_save_time = current_time
-
-            # Save updated results after recovery
-            with open(os.path.join(self.count_out_dir, 'altTSSdict_after_recovery.pkl'), 'wb') as f:
+                failed_genes = [gid for gid in readinfodict if gid not in altTSSdict]
+                logging.warning(f"[RECOVERY] Reconstructed {len(failed_genes)} failed genes from readinfodict and altTSSdict.")
+                
+            altTSSdict = self._recover_failed_genes_parallel(failed_genes, readinfodict, altTSSdict)
+            # Final save
+            tss_output = os.path.join(self.count_out_dir, 'before_cluster_peak_Final.pkl')
+            with open(tss_output, 'wb') as f:
                 pickle.dump(altTSSdict, f)
-            
-            # Save updated failed gene list
-            with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
-                f.write('\n'.join(failed_genes))
-            
-            if failed_genes:
-                logging.warning(f"Still failed after recovery: {len(failed_genes)} genes")
-                for gid in failed_genes:
-                    logging.warning(f"  - {gid}")
-                print("Clustering halted due to unrecoverable genes. See log.txt for details.")
-                sys.exit(1)
-            else:
-                logging.warning(f"Recovered {recovered} genes using chunked multiprocessing.")
-                                        
+                            
             return altTSSdict
+            
         #otherwise start clustering from a checkpoint or from the begining        
         elif os.path.exists(hourly_path):
             print("Resuming from altTSSdict_hourly.pkl...")
             with open(hourly_path, 'rb') as f:
                 altTSSdict = pickle.load(f)
-
             
         readls = list(readinfodict.keys())
         args = [(gid, readinfodict[gid]) for gid in readls if gid not in altTSSdict]
         skipped_genes = [gid for gid in readls if gid in altTSSdict]
         logging.warning(f"Skipping {len(skipped_genes)} genes already clustered.")
         print(f"Clustering {len(args)} genes with {self.nproc} processes...")
-    
 
-        
         with ProcessPoolExecutor(max_workers=self.nproc) as executor:
             futures = {executor.submit(self._do_clustering, arg): arg[0] for arg in args}
         
@@ -557,7 +574,6 @@ class get_TSS_count():
                     else:
                         logging.warning(f"Gene {geneid} failed (timeout or exception)")
                         failed_genes.append(geneid)
-
                         
                 except Exception as e:
                     futures.pop(future)
@@ -588,58 +604,13 @@ class get_TSS_count():
             with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
                 f.write('\n'.join(failed_genes))
 
-            # --- Retry failed genes one-by-one using chunked multiprocessing ---
-            recovered = 0
-            recovery_start_time = time.time()
-            last_recovery_save_time = recovery_start_time
+            #  Retry failed genes one-by-one using chunked multiprocessing ---
+            altTSSdict = self._recover_failed_genes_parallel(failed_genes, readinfodict, altTSSdict)
 
-            for geneid in failed_genes[:]:  # iterate over a copy since we may modify the list
-                readinfo = readinfodict.get(geneid)
-                if not readinfo:
-                    logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
-                    continue
-
-                with ProcessPoolExecutor(max_workers=1) as recovery_executor:
-                    future = recovery_executor.submit(self._do_clustering_heavy, (geneid, readinfo))
-                    try:
-                        geneid, res = future.result(timeout=600)  # 10-minute timeout
-                        if res is not None:
-                            altTSSdict[geneid] = res
-                            recovered += 1
-                            failed_genes.remove(geneid)
-                            logging.warning(f"[RECOVERY] Successfully clustered {geneid} with chunked multiprocessing.")
-                        else:
-                            logging.warning(f"[RECOVERY] Gene {geneid} still failed after chunked retry.")
-                    except TimeoutError:
-                        logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s during heavy clustering.")
-
-                current_time = time.time()
-                if current_time - last_recovery_save_time >= 3600:
-                    checkpoint_path = os.path.join(self.count_out_dir, 'altTSSdict_recovery_hourly.pkl')
-                    with open(checkpoint_path, 'wb') as f:
-                        pickle.dump(altTSSdict, f)
-                    with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
-                        f.write('\n'.join(failed_genes))
-                    logging.warning(f"[RECOVERY] Checkpoint saved to altTSSdict_recovery_hourly.pkl at {int((current_time - recovery_start_time) / 60)} min")
-                    last_recovery_save_time = current_time
-
-
-            # Save updated results after recovery
-            with open(os.path.join(self.count_out_dir, 'altTSSdict_after_recovery.pkl'), 'wb') as f:
-                pickle.dump(altTSSdict, f)
-            
-            # Save updated failed gene list
-            with open(os.path.join(self.count_out_dir, 'failed_genes.txt'), 'w') as f:
-                f.write('\n'.join(failed_genes))
-            
-            if failed_genes:
-                logging.warning(f"Still failed after recovery: {len(failed_genes)} genes")
-                for gid in failed_genes:
-                    logging.warning(f"  - {gid}")
-                print("Clustering halted due to unrecoverable genes. See log.txt for details.")
-                sys.exit(1)
-            else:
-                logging.warning(f"Recovered {recovered} genes using chunked multiprocessing.")
+        # Final save
+        tss_output = os.path.join(self.count_out_dir, 'before_cluster_peak_Final.pkl')
+        with open(tss_output, 'wb') as f:
+            pickle.dump(altTSSdict, f)
                                         
         return altTSSdict
 
