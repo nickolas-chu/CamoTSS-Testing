@@ -206,30 +206,6 @@ class get_TSS_count():
 
         return readinfodict
     
-    
-    def _cluster_chunk(self, chunk):
-        posi = np.array([r[0] for r in chunk]).reshape(-1, 1)
-        CB = np.array([r[1] for r in chunk]).reshape(-1, 1)
-        cigar = np.array([r[2] for r in chunk]).reshape(-1, 1)
-    
-        model = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
-        labels = model.fit(posi).labels_
-    
-        clusters = []
-        for lbl in np.unique(labels):
-            clusters.append([
-                posi[labels == lbl],
-                CB[labels == lbl],
-                cigar[labels == lbl]
-            ])
-        return clusters
-        
-    def _assign_leftover_chunk(chunk, centroids):
-        from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=1).fit(centroids)
-        assigned = nn.kneighbors(chunk, return_distance=False).flatten()
-        return assigned
-
 
     def _do_clustering(self, args):
         geneid, readinfo_full = args
