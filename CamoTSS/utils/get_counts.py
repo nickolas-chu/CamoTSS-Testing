@@ -350,20 +350,16 @@ class get_TSS_count():
             logging.error(f"FAILED: Gene {geneid} - {type(e).__name__}: {e}")
             return (geneid, None)
 
-
-    def _do_clustering_heavy(self, args, chunk_nproc):
+    # New helper: sample-only clustering (no inner Pool)
+    def _do_clustering_sample(self, args):
         geneid, readinfo_full = args
-        logging.warning(f"[HEAVY] Starting heavy clustering for {geneid} with {len(readinfo_full)} reads")
-    
+        logging.warning(f"[SAMPLE] Starting sample clustering for {geneid} with {len(readinfo_full)} reads")
         try:
             MAX_CLUSTER_READS = 20000
             from collections import defaultdict
-            downsampled = False
     
-            # --- Downsampling logic ---
+            # --- Downsampling logic (same as before) ---
             if len(readinfo_full) > MAX_CLUSTER_READS:
-                logging.warning(f"[HEAVY] Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
-    
                 condition_groups = defaultdict(lambda: defaultdict(list))
                 for read in readinfo_full:
                     barcode = read[1]
@@ -393,7 +389,7 @@ class get_TSS_count():
                 readinfo_leftover = []
                 downsampled = False
     
-            # --- Clustering on sample ---
+            # --- Clustering on sample (same as before) ---
             posi_sample = np.array([t[0] for t in readinfo_sample]).reshape(-1, 1)
             CB_sample = np.array([t[1] for t in readinfo_sample]).reshape(-1, 1)
             cigar_sample = np.array([t[2] for t in readinfo_sample]).reshape(-1, 1)
@@ -409,77 +405,129 @@ class get_TSS_count():
                     cigar_sample[labels_sample == lbl]
                 ])
     
-            # --- Assign leftover reads using multiprocessing ---
-            if downsampled and len(altTSSls_raw) > 0 and len(readinfo_leftover) > 0:
-                cluster_bounds = []
-                cluster_centroids = []
-                for cluster in altTSSls_raw:
-                    positions = cluster[0].flatten()
-                    cluster_bounds.append((np.min(positions), np.max(positions)))
-                    cluster_centroids.append(np.mean(positions))
+            # compute cluster metadata and leftover-chunk descriptors that the main process will use
+            cluster_bounds = []
+            cluster_centroids = []
+            for cluster in altTSSls_raw:
+                positions = cluster[0].flatten()
+                cluster_bounds.append((np.min(positions), np.max(positions)))
+                cluster_centroids.append(np.mean(positions))
     
-                CHUNK_SIZE = 5000
-                chunks = [readinfo_leftover[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_leftover), CHUNK_SIZE)]
+            # chunk leftovers into descriptors (do not assign here)
+            CHUNK_SIZE = 5000
+            chunks = [readinfo_leftover[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_leftover), CHUNK_SIZE)]
     
-
-                with get_context("spawn").Pool(processes=min(chunk_nproc, len(chunks))) as pool:
-                    assigned_chunks = pool.starmap(
-                        _assign_leftover_chunk_bounded,
-                        [(chunk, cluster_bounds, cluster_centroids) for chunk in chunks]
-                    )
-    
-                for chunk in assigned_chunks:
-                    for read, lbl_idx in chunk:
-                        altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
-                        altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
-                        altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
-                        
-            # --- Filter clusters by minCount ---
-            altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
-            logging.warning(f"[HEAVY] Gene {geneid}: {len(altTSSls_raw)} raw clusters → {len(altTSSls)} after minCount={self.minCount}")
-            return (geneid, altTSSls)
+            # return everything needed by main thread to submit chunk tasks
+            return {
+                "geneid": geneid,
+                "altTSSls_raw": altTSSls_raw,
+                "downsampled": downsampled,
+                "cluster_bounds": cluster_bounds,
+                "cluster_centroids": cluster_centroids,
+                "chunks": chunks
+            }
     
         except Exception as e:
-            logging.error(f"[HEAVY] FAILED: Gene {geneid} - {type(e).__name__}: {e}")
-            return (geneid, None)
-
-
-
+            logging.error(f"[SAMPLE] FAILED: Gene {geneid} - {type(e).__name__}: {e}")
+            return {"geneid": geneid, "error": True}
+    
+    
+    # Updated recovery that uses a single shared chunk Pool
     def _recover_failed_genes_parallel(self, failed_genes, readinfodict, altTSSdict):
         recovered = 0
-        gene_nproc = 5  # Always process 5 genes at a time
-        total_cores = self.nproc  
-        chunk_nproc = max(1, (total_cores - gene_nproc) // gene_nproc)
-
-        recovery_start_time = time.time()
-        last_recovery_save_time = recovery_start_time
+        gene_nproc = 3  # how many sample-clustering gene workers run concurrently
+        total_cores = max(1, int(self.nproc))
+        # allocate remaining cores to the shared chunk pool (at least 1)
+        chunk_pool_procs = max(1, total_cores - gene_nproc)
     
         args = [(geneid, readinfodict.get(geneid)) for geneid in failed_genes if readinfodict.get(geneid)]
         skipped = [geneid for geneid in failed_genes if not readinfodict.get(geneid)]
         for geneid in skipped:
             logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
     
-        with ProcessPoolExecutor(max_workers=gene_nproc) as executor:
-            futures = {executor.submit(self._do_clustering_heavy, arg, chunk_nproc): arg[0] for arg in args}
-            for future in as_completed(futures):
-                geneid = futures[future]
-                try:
-                    geneid, res = future.result(timeout=600)
-                    if res is not None:
-                        altTSSdict[geneid] = res
+        # create a shared chunk Pool in the main process (spawn start)
+        ctx = get_context("spawn")
+        chunk_pool = ctx.Pool(processes=chunk_pool_procs)
+    
+        try:
+            # Phase A: run sample clustering in parallel (no nested pools)
+            with ProcessPoolExecutor(max_workers=gene_nproc) as executor:
+                sample_futures = {executor.submit(self._do_clustering_sample, arg): arg[0] for arg in args}
+    
+                # as each gene sample finishes, submit its chunk tasks to the shared chunk_pool
+                for future in as_completed(sample_futures):
+                    geneid = sample_futures[future]
+                    try:
+                        sample_res = future.result(timeout=1200)
+                    except Exception as e:
+                        logging.error(f"[RECOVERY] Sample clustering failed for {geneid}: {type(e).__name__}: {e}")
+                        continue
+    
+                    if sample_res.get("error"):
+                        logging.warning(f"[RECOVERY] Sample clustering returned error for {geneid}, skipping.")
+                        continue
+    
+                    # get items returned
+                    geneid = sample_res["geneid"]
+                    altTSSls_raw = sample_res["altTSSls_raw"]
+                    downsampled = sample_res["downsampled"]
+                    cluster_bounds = sample_res["cluster_bounds"]
+                    cluster_centroids = sample_res["cluster_centroids"]
+                    chunks = sample_res["chunks"]
+    
+                    # if nothing to do, finalize gene immediately
+                    if not (downsampled and len(altTSSls_raw) > 0 and len(chunks) > 0):
+                        # just filter clusters by minCount and save
+                        altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
+                        altTSSdict[geneid] = altTSSls
                         recovered += 1
+                        if geneid in failed_genes:
+                            failed_genes.remove(geneid)
+                        logging.warning(f"[RECOVERY] Gene {geneid} required no chunk assignment, saved {len(altTSSls)} clusters.")
+                        continue
+    
+                    # submit chunk tasks to shared pool
+                    logging.warning(f"[RECOVERY] Submitting {len(chunks)} chunks for gene {geneid} to shared chunk pool "
+                                    f"(bounds={len(cluster_bounds)}, procs={chunk_pool_procs})")
+    
+                    # use starmap_async to assign each chunk; pass cluster_bounds + centroids as immutable arguments
+                    task_iter = [(chunk, cluster_bounds, cluster_centroids) for chunk in chunks]
+                    async_result = chunk_pool.starmap_async(_assign_leftover_chunk_bounded, task_iter)
+    
+                    # wait for chunk assignment to complete (optionally add a timeout)
+                    try:
+                        assigned_chunks = async_result.get(timeout=1800)  # adjust timeout as needed
+                    except Exception as e:
+                        logging.error(f"[RECOVERY] Chunk assignment failed/timeout for gene {geneid}: {type(e).__name__}: {e}")
+                        continue
+    
+                    # merge assigned_chunks into altTSSls_raw
+                    for chunk_res in assigned_chunks:
+                        for read, lbl_idx in chunk_res:
+                            altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
+                            altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
+                            altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
+    
+                    # Filter clusters by minCount and save
+                    altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
+                    altTSSdict[geneid] = altTSSls
+                    recovered += 1
+                    if geneid in failed_genes:
                         failed_genes.remove(geneid)
-                        logging.warning(f"[RECOVERY] Successfully clustered {geneid}.")
-                    else:
-                        logging.warning(f"[RECOVERY] Gene {geneid} still failed after retry.")
-                except TimeoutError:
-                    logging.error(f"[RECOVERY] TIMEOUT: Gene {geneid} exceeded 600s.")
+                    logging.warning(f"[RECOVERY] Successfully recovered gene {geneid}: {len(altTSSls)} clusters saved.")
     
-                current_time = time.time()
-                if current_time - last_recovery_save_time >= 3600:
-                    self._save_recovery_checkpoint(altTSSdict, failed_genes)
-                    last_recovery_save_time = current_time
+                    # periodic checkpointing can be done here if desired
+                    # self._save_recovery_checkpoint(altTSSdict, failed_genes)  # optionally call
     
+        finally:
+            # ensure we always close the shared chunk pool
+            try:
+                chunk_pool.close()
+                chunk_pool.join()
+            except Exception:
+                pass
+    
+        # final checkpoint and failure handling (preserve your original behavior)
         self._save_recovery_checkpoint(altTSSdict, failed_genes, final=True)
     
         if failed_genes:
@@ -492,6 +540,7 @@ class get_TSS_count():
             logging.warning(f"Recovered {recovered} genes using parallel recovery.")
     
         return altTSSdict
+
 
     def _save_recovery_checkpoint(self, altTSSdict, failed_genes, final=False):
         suffix = 'after_recovery' if final else 'recovery_hourly'
