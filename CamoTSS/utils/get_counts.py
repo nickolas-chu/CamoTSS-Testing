@@ -22,6 +22,7 @@ import sys
 from sklearn.neighbors import NearestNeighbors
 from multiprocessing import Pool
 from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
+from collections import defaultdict
 class TimeoutException(Exception):
     pass
 
@@ -219,7 +220,6 @@ class get_TSS_count():
         signal.alarm(600)
     
         try:
-            from collections import defaultdict
             downsampled = False
     
             # --- Downsampling logic ---
@@ -390,9 +390,9 @@ class get_TSS_count():
                 cluster_centroids.append(np.mean(positions))
     
             # chunk leftovers into descriptors (do not assign here)
-            CHUNK_SIZE = 5000
+            CHUNK_SIZE = 10000
             chunks = [readinfo_leftover[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_leftover), CHUNK_SIZE)]
-    
+            logging.warning(f"[SAMPLE] Finished sample clustering for {geneid} with {len(readinfo_full)} reads")
             # return everything needed by main thread to submit chunk tasks
             return {
                 "geneid": geneid,
@@ -411,7 +411,7 @@ class get_TSS_count():
     # Updated recovery that uses a single shared chunk Pool
     def _recover_failed_genes_parallel(self, failed_genes, readinfodict, altTSSdict):
         recovered = 0
-        gene_nproc = 3  # how many sample-clustering gene workers run concurrently
+        gene_nproc = 2  # how many sample-clustering gene workers run concurrently
         total_cores = max(1, int(self.nproc))
         # allocate remaining cores to the shared chunk pool (at least 1)
         chunk_pool_procs = max(1, total_cores - gene_nproc)
@@ -433,6 +433,7 @@ class get_TSS_count():
                 # as each gene sample finishes, submit its chunk tasks to the shared chunk_pool
                 for future in as_completed(sample_futures):
                     geneid = sample_futures[future]
+                    logging.warning(f"Returned sample clustering for {geneid}")
                     try:
                         sample_res = future.result(timeout=1200)
                     except Exception as e:
@@ -472,17 +473,33 @@ class get_TSS_count():
     
                     # wait for chunk assignment to complete (optionally add a timeout)
                     try:
+                        logging.warning(f"[RECOVERY] Waiting for chunk assignment to complete for {geneid}")
                         assigned_chunks = async_result.get(timeout=1800)  # adjust timeout as needed
+                        logging.warning(f"[RECOVERY] Chunk assignment completed for {geneid}")
                     except Exception as e:
                         logging.error(f"[RECOVERY] Chunk assignment failed/timeout for gene {geneid}: {type(e).__name__}: {e}")
                         continue
     
                     # merge assigned_chunks into altTSSls_raw
+                    # Step 1: collect reads per cluster label
+                    cluster_batches = defaultdict(list)
                     for chunk_res in assigned_chunks:
                         for read, lbl_idx in chunk_res:
-                            altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
-                            altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
-                            altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
+                            cluster_batches[lbl_idx].append(read)
+
+                    # Step 2: stack all reads per cluster in one go
+                    logging.warning(f"[MERGE] Begin chunk stacking for {geneid}")
+                    for lbl_idx, reads in cluster_batches.items():
+                        try:
+                            posi_stack = np.vstack([r[0] for r in reads])
+                            CB_stack = np.vstack([r[1] for r in reads])
+                            cigar_stack = np.vstack([r[2] for r in reads])
+
+                            altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_stack))
+                            altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_stack))
+                            altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_stack))
+                        except Exception as e:
+                            logging.error(f"[MERGE] Failed to stack cluster {lbl_idx}: {type(e).__name__}: {e}")
     
                     # Filter clusters by minCount and save
                     altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
