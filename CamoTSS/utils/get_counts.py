@@ -865,12 +865,18 @@ class get_TSS_count():
 
         return transcriptdict
 
-
     def _load_and_annotate(self, inputpair):
         geneid, filepath = inputpair
         with open(filepath, "rb") as f:
             altTSSitemdict = pickle.load(f)
-        return self._do_anno_and_filter((geneid, altTSSitemdict))
+
+        result = self._do_anno_and_filter((geneid, altTSSitemdict))
+
+        # Save result to disk
+        outpath = os.path.join(self.count_out_dir, f"anno_{geneid}.pkl")
+        with open(outpath, "wb") as f:
+            pickle.dump(result, f)
+        return outpath
 
 
     def _TSS_annotation(self):
@@ -893,30 +899,45 @@ class get_TSS_count():
         keepIDls = list(keepdict.keys())
     
         # Step 2: Save each gene's cluster data to disk and prepare input parameters
+        # Step 2: Save each gene's cluster data to disk if not already present
         inputpar = []
         for geneid in keepIDls:
             filepath = os.path.join(self.count_out_dir, f"cluster_{geneid}.pkl")
-            with open(filepath, "wb") as f:
-                pickle.dump(keepdict[geneid], f)
+            if os.path.exists(filepath):
+                logging.warning(f"[RECOVERY] Found existing cluster file for {geneid}, skipping write.")
+            else:
+                with open(filepath, "wb") as f:
+                    pickle.dump(keepdict[geneid], f)
+                logging.warning(f"[RECOVERY] Saved cluster file for {geneid}")
             inputpar.append((geneid, filepath))
     
         # Step 3: Annotate in parallel using file paths
         with multiprocessing.Pool(self.nproc) as pool:
-            transcriptdictls = pool.map(self._load_and_annotate, inputpar)
-    
-        # Step 4: Delete temporary cluster files
+            result_paths = pool.map(self._load_and_annotate, inputpar)
+
+        # Step 4: Load results from disk and delete result files
+        transcriptdictls = []
+        for path in result_paths:
+            try:
+                with open(path, "rb") as f:
+                    transcriptdictls.append(pickle.load(f))
+                os.remove(path)
+            except Exception as e:
+                logging.warning(f"[RECOVERY] Failed to load/delete result file {path}: {type(e).__name__}: {e}")
+
+        # Step 5: Delete temporary cluster files
         for _, filepath in inputpar:
             try:
                 os.remove(filepath)
             except Exception as e:
                 logging.warning(f"[RECOVERY] Failed to delete temp file {filepath}: {type(e).__name__}: {e}")
-    
-        # Step 5: Save annotation results
+        
+        # Step 6: Save annotation results
         tss_output = os.path.join(self.count_out_dir, 'temp_tss.pkl')
         with open(tss_output, 'wb') as f:
             pickle.dump(transcriptdictls, f)
     
-        # Step 6: Flatten and organize results
+        # Step 7: Flatten and organize results
         extendls = []
         for d in transcriptdictls:
             extendls.extend(list(d.items()))
@@ -935,7 +956,7 @@ class get_TSS_count():
         extendls_df.to_csv(os.path.join(self.count_out_dir, 'extendls.csv'), index=False)
         regiondf.to_csv(os.path.join(self.count_out_dir, 'regiondf.csv'))
 
-    return extendls, regiondf
+        return extendls, regiondf
 
         
 
