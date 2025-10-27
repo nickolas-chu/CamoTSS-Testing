@@ -866,6 +866,13 @@ class get_TSS_count():
         return transcriptdict
 
 
+    def _load_and_annotate(self, inputpair):
+        geneid, filepath = inputpair
+        with open(filepath, "rb") as f:
+            altTSSitemdict = pickle.load(f)
+        return self._do_anno_and_filter((geneid, altTSSitemdict))
+
+
     def _TSS_annotation(self):
         
         start_time = time.time()
@@ -895,13 +902,7 @@ class get_TSS_count():
     
         # Step 3: Annotate in parallel using file paths
         with multiprocessing.Pool(self.nproc) as pool:
-            transcriptdictls = pool.map(
-                lambda inputpair: self._do_anno_and_filter((
-                    inputpair[0],
-                    pickle.load(open(inputpair[1], "rb"))
-                )),
-                inputpar
-            )
+            transcriptdictls = pool.map(self._load_and_annotate, inputpar)
     
         # Step 4: Delete temporary cluster files
         for _, filepath in inputpar:
