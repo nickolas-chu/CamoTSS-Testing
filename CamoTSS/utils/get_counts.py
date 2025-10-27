@@ -866,47 +866,77 @@ class get_TSS_count():
         return transcriptdict
 
 
-
     def _TSS_annotation(self):
-        start_time=time.time()
-
-        keepdict=self._filter_false_positive()
-
-        keepIDls=list(keepdict.keys())
         
-        inputpar=[]
-        for i in keepIDls:
-            inputpar.append((i,keepdict[i]))
-
-        pool = multiprocessing.Pool(processes=self.nproc)
+        start_time = time.time()
+    
+        keepdict_path = os.path.join(self.count_out_dir, 'keepdict.pkl')
+    
+        # Step 1: Load or compute keepdict
+        if os.path.exists(keepdict_path):
+            logging.warning("[RECOVERY] Loading existing keepdict.pkl")
+            with open(keepdict_path, "rb") as f:
+                keepdict = pickle.load(f)
+        else:
+            logging.warning("[RECOVERY] Computing keepdict from scratch")
+            keepdict = self._filter_false_positive()
+            with open(keepdict_path, "wb") as f:
+                pickle.dump(keepdict, f)
+    
+        keepIDls = list(keepdict.keys())
+    
+        # Step 2: Save each gene's cluster data to disk and prepare input parameters
+        inputpar = []
+        for geneid in keepIDls:
+            filepath = os.path.join(self.count_out_dir, f"cluster_{geneid}.pkl")
+            with open(filepath, "wb") as f:
+                pickle.dump(keepdict[geneid], f)
+            inputpar.append((geneid, filepath))
+    
+        # Step 3: Annotate in parallel using file paths
         with multiprocessing.Pool(self.nproc) as pool:
-            #transcriptdictls=pool.map_async(self.filter_false_positive,inputpar).get()
-            transcriptdictls=pool.map_async(self._do_anno_and_filter,inputpar).get()
-
-
-        tss_output=self.count_out_dir+'temp_tss.pkl'
-        with open(tss_output,'wb') as f:
-            pickle.dump(transcriptdictls,f)
-
-        extendls=[]
+            transcriptdictls = pool.map(
+                lambda inputpair: self._do_anno_and_filter((
+                    inputpair[0],
+                    pickle.load(open(inputpair[1], "rb"))
+                )),
+                inputpar
+            )
+    
+        # Step 4: Delete temporary cluster files
+        for _, filepath in inputpar:
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                logging.warning(f"[RECOVERY] Failed to delete temp file {filepath}: {type(e).__name__}: {e}")
+    
+        # Step 5: Save annotation results
+        tss_output = os.path.join(self.count_out_dir, 'temp_tss.pkl')
+        with open(tss_output, 'wb') as f:
+            pickle.dump(transcriptdictls, f)
+    
+        # Step 6: Flatten and organize results
+        extendls = []
         for d in transcriptdictls:
             extendls.extend(list(d.items()))
+    
+        d = {
+            'transcript_id': [transcript[0] for transcript in extendls],
+            'TSS_start': [np.min(transcript[1][0]) for transcript in extendls],
+            'TSS_end': [np.max(transcript[1][0]) for transcript in extendls]
+        }
+        regiondf = pd.DataFrame(d)
+    
+        print('do annotation Time elapsed', int(time.time() - start_time), 'seconds.')
+    
+        # Save CSV outputs
+        extendls_df = pd.DataFrame(extendls, columns=['transcript_id', 'details'])
+        extendls_df.to_csv(os.path.join(self.count_out_dir, 'extendls.csv'), index=False)
+        regiondf.to_csv(os.path.join(self.count_out_dir, 'regiondf.csv'))
 
+    return extendls, regiondf
 
         
-        ### organize the output result
-        d={'transcript_id':[transcript[0] for transcript in extendls],'TSS_start':[np.min(transcript[1][0]) for transcript in extendls],
-        'TSS_end':[np.max(transcript[1][0]) for transcript in extendls]}
-
-        regiondf=pd.DataFrame(d)
-        print('do annotation Time elapsed',int(time.time()-start_time),'seconds.')
-        # print(extendls)
-        # print(regiondf)
-        # Convert extendls to a DataFrame and write to a CSV file
-        extendls_df = pd.DataFrame(extendls, columns=['transcript_id', 'details'])
-        extendls_df.to_csv('extendls.csv', index=False)
-        regiondf.to_csv('regiondf.csv')
-        return extendls,regiondf
 
 
 
