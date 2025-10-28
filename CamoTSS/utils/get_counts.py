@@ -977,7 +977,7 @@ class get_TSS_count():
 
     def produce_sclevel(self):
         ctime=time.time()
-        extendls_path = os.path.join(self.count_out_dir, 'extendls.csv')
+        extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
         regiondf_path = os.path.join(self.count_out_dir, 'regiondf.csv')
 
         if not (os.path.exists(extendls_path) and os.path.exists(regiondf_path)):
