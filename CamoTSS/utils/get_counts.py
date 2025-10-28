@@ -1032,17 +1032,29 @@ class get_TSS_count():
             os.rmdir(temp_dir)
         except Exception as e:
             logging.warning(f"[SCLEVEL] Failed to remove temp directory {temp_dir}: {type(e).__name__}: {e}")
-    
-        # Populate finaldf
-        for result in results:
+        
+        logging.warning("[SCLEVEL] Preallocating matrix.")
+        # Preallocate matrix
+        n_cells = len(final_index)
+        n_transcripts = len(results)
+        
+        matrix = np.zeros((n_cells, n_transcripts), dtype=np.float32)
+        transcript_ids = []
+
+        
+        logging.warning("[SCLEVEL] Populating finaldf.")
+        for i, result in enumerate(results):
             if result is not None:
                 transcriptid, col = result
-                finaldf[transcriptid] = col
-    
+                matrix[:, i] = col.values
+                transcript_ids.append(transcriptid)
+        
+        # Build DataFrame in one step
+        finaldf = pd.DataFrame(matrix, index=final_index, columns=transcript_ids)
+        
         logging.warning(f"[SCLEVEL] Finished building transcript matrix with {len(finaldf.columns)} columns.")
-    
+        
         # Save outputs
-        finaldf.fillna(0, inplace=True)
         finaldf.to_csv('finaldf.csv')
         adata = ad.AnnData(finaldf)
         adata.write('adata.h5ad')
