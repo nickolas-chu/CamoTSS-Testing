@@ -34,15 +34,29 @@ class TimeoutException(Exception):
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings("ignore", category=Warning)
 
+def build_transcript_column_from_path(path, final_index):
+    import pickle
+    import numpy as np
+    import pandas as pd
+    import os
+    import logging
 
+    try:
+        with open(path, 'rb') as f:
+            extend_entry = pickle.load(f)
 
-def build_transcript_column(extend_entry, final_index):
-    transcriptid = extend_entry[0]
-    cellID, count = np.unique(extend_entry[1][1], return_counts=True)
-    transcriptdf = pd.DataFrame({'cell_id': cellID, transcriptid: count})
-    transcriptdf.set_index('cell_id', inplace=True)
-    return transcriptid, final_index.map(transcriptdf[transcriptid]).fillna(0)
+        transcriptid = extend_entry[0]
+        cellID, count = np.unique(extend_entry[1][1], return_counts=True)
+        transcriptdf = pd.DataFrame({'cell_id': cellID, transcriptid: count})
+        transcriptdf.set_index('cell_id', inplace=True)
+        result = transcriptid, final_index.map(transcriptdf[transcriptid]).fillna(0)
 
+        logging.warning(f"[SCLEVEL] Processed {transcriptid} from {os.path.basename(path)}")
+        return result
+
+    except Exception as e:
+        logging.error(f"[SCLEVEL] Failed to process {path}: {type(e).__name__}: {e}")
+        return None
 
 def get_fastq_file(fastqFilePath):
     fastqFile=pysam.FastaFile(fastqFilePath)
@@ -968,93 +982,107 @@ class get_TSS_count():
 
         return extendls, regiondf
    
-
+    
     def produce_sclevel(self):
-        ctime=time.time()
+        ctime = time.time()
         extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
         regiondf_path = os.path.join(self.count_out_dir, 'regiondf.csv')
-
+    
         if not (os.path.exists(extendls_path) and os.path.exists(regiondf_path)):
             extendls, regiondf = self._TSS_annotation()
         else:
-            logging.warning("[SCLEVEL] Found existing extendls.csv and regiondf.csv — resuming from saved annotation results.")
-            regiondf = pd.read_csv(regiondf_path)
-            extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
+            logging.warning("[SCLEVEL] Found existing extendls.pkl and regiondf.csv — resuming from saved annotation results.")
             with open(extendls_path, 'rb') as f:
                 extendls = pickle.load(f)
-
-        #transcriptdfls=[]
-
-        cellIDls=[]
-        for i in range(0,len(extendls)):
-            cellID=np.unique(extendls[i][1][1])
-            cellIDls.append(list(cellID))
+            regiondf = pd.read_csv(regiondf_path)
+    
+        # Build final index
+        cellIDls = [list(np.unique(entry[1][1])) for entry in extendls]
         cellIDset = set([item for sublist in cellIDls for item in sublist])
-
-        self._final_index = pd.Index(list(cellIDset))  # store once
-        finaldf = pd.DataFrame(index=self._final_index)
-
-        args = [(entry, self._final_index) for entry in extendls]
+        final_index = pd.Index(list(cellIDset))
+        finaldf = pd.DataFrame(index=final_index)
+    
+        # Save each extend_entry to disk
+        temp_dir = os.path.join(self.count_out_dir, 'temp_extend_entries')
+        os.makedirs(temp_dir, exist_ok=True)
+        paths = []
+    
+        for i, entry in enumerate(extendls):
+            path = os.path.join(temp_dir, f'extend_{i}.pkl')
+            with open(path, 'wb') as f:
+                pickle.dump(entry, f)
+            paths.append(path)
+    
+        logging.warning(f"[SCLEVEL] Saved {len(paths)} extend entries to disk for streaming.")
+    
+        # Dispatch paths to workers
+        from multiprocessing import Pool
+        args = [(path, final_index) for path in paths]
+    
         with Pool(self.nproc) as pool:
-            results = pool.starmap(build_transcript_column, args)
-        
-
-
-        for transcriptid, col in results:
-            finaldf[transcriptid] = col
-
-        logging.warning(f"[SCLEVEL] Finished building transcript matrix with {len(results)} columns.")
-
-        finaldf.fillna(0,inplace=True)
+            results = pool.starmap(build_transcript_column_from_path, args)
+    
+        # Clean up temp files
+        for path in paths:
+            try:
+                os.remove(path)
+            except Exception as e:
+                logging.warning(f"[SCLEVEL] Failed to delete temp file {path}: {type(e).__name__}: {e}")
+        try:
+            os.rmdir(temp_dir)
+        except Exception as e:
+            logging.warning(f"[SCLEVEL] Failed to remove temp directory {temp_dir}: {type(e).__name__}: {e}")
+    
+        # Populate finaldf
+        for result in results:
+            if result is not None:
+                transcriptid, col = result
+                finaldf[transcriptid] = col
+    
+        logging.warning(f"[SCLEVEL] Finished building transcript matrix with {len(finaldf.columns)} columns.")
+    
+        # Save outputs
+        finaldf.fillna(0, inplace=True)
         finaldf.to_csv('finaldf.csv')
-        adata=ad.AnnData(finaldf)
+        adata = ad.AnnData(finaldf)
         adata.write('adata.h5ad')
-        vardf=pd.DataFrame(adata.var.copy())
+    
+        vardf = pd.DataFrame(adata.var.copy())
         vardf.reset_index(inplace=True)
-        vardf.columns=['transcript_id']
-        vardf=vardf.join(regiondf.set_index('transcript_id'), on='transcript_id')
-        vardf['gene_id']=vardf['transcript_id'].str.split('_',expand=True)[0]
-        vardf=vardf.merge(self.generefdf,on='gene_id')
-        vardf.set_index('transcript_id',drop=True,inplace=True)
-
-        adata.var=vardf
-        sc_output_h5ad=self.count_out_dir+'scTSS_count_all.h5ad'
+        vardf.columns = ['transcript_id']
+        vardf = vardf.join(regiondf.set_index('transcript_id'), on='transcript_id')
+        vardf['gene_id'] = vardf['transcript_id'].str.split('_', expand=True)[0]
+        vardf = vardf.merge(self.generefdf, on='gene_id')
+        vardf.set_index('transcript_id', drop=True, inplace=True)
+        adata.var = vardf
+    
+        sc_output_h5ad = os.path.join(self.count_out_dir, 'scTSS_count_all.h5ad')
         adata.write(sc_output_h5ad)
-
-        #filter according to user' defined distance
-        newdf=adata.var.copy()
+    
+        # Filter by cluster distance
+        newdf = adata.var.copy()
         newdf.reset_index(inplace=True)
-        selectedf=newdf[newdf.duplicated('gene_id',keep=False)]  #get data frame which includes two transcript for one gene
-        geneID=selectedf['gene_id'].unique()
-
-        keepdfls=[]
+        selectedf = newdf[newdf.duplicated('gene_id', keep=False)]
+        geneID = selectedf['gene_id'].unique()
+    
+        keepdfls = []
         for i in geneID:
-            tempdf=selectedf[selectedf['gene_id']==i]
-
-            tempdf=tempdf.sort_values('transcript_id',ascending=False)
-            tempdf['diff']=tempdf['TSS_start'].diff()
-            keepdf=tempdf[tempdf['diff'].isna()|tempdf['diff'].abs().ge(self.clusterDistance)]    #want to get TSS whose cluster distance is more than user defined.
-            #keepdf=keepdf.iloc[:2,:]
+            tempdf = selectedf[selectedf['gene_id'] == i]
+            tempdf = tempdf.sort_values('transcript_id', ascending=False)
+            tempdf['diff'] = tempdf['TSS_start'].diff()
+            keepdf = tempdf[tempdf['diff'].isna() | tempdf['diff'].abs().ge(self.clusterDistance)]
             keepdfls.append(keepdf)
-
-        #print(keepdfls)
-
-
-        allkeepdf=reduce(lambda x,y:pd.concat([x,y]),keepdfls)
-        finaltwodf=allkeepdf[allkeepdf.duplicated('gene_id',keep=False)]
-        finaltwoadata=adata[:,adata.var.index.isin(finaltwodf['transcript_id'])]
-
-        sc_output_h5ad=self.count_out_dir+'scTSS_count_two.h5ad'
+    
+        allkeepdf = reduce(lambda x, y: pd.concat([x, y]), keepdfls)
+        finaltwodf = allkeepdf[allkeepdf.duplicated('gene_id', keep=False)]
+        finaltwoadata = adata[:, adata.var.index.isin(finaltwodf['transcript_id'])]
+    
+        sc_output_h5ad = os.path.join(self.count_out_dir, 'scTSS_count_two.h5ad')
         finaltwoadata.write(sc_output_h5ad)
-
-
-        print('produce h5ad Time elapsed',int(time.time()-ctime),'seconds.')
-
-
+    
+        print('produce h5ad Time elapsed', int(time.time() - ctime), 'seconds.')
         return adata
-
-
-
+    
 
 
 
