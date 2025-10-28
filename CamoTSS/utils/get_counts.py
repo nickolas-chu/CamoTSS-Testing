@@ -961,20 +961,15 @@ class get_TSS_count():
         regiondf.to_csv(os.path.join(self.count_out_dir, 'regiondf.csv'))
 
         return extendls, regiondf
-
-        
-
-
-
-    def _build_transcript_column(self, extend_entry, final_index):
+   
+    def _build_transcript_column(self, extend_entry):
         transcriptid = extend_entry[0]
         cellID, count = np.unique(extend_entry[1][1], return_counts=True)
         transcriptdf = pd.DataFrame({'cell_id': cellID, transcriptid: count})
         transcriptdf.set_index('cell_id', inplace=True)
-        return transcriptid, final_index.map(transcriptdf[transcriptid]).fillna(0)
+        return transcriptid, self._final_index.map(transcriptdf[transcriptid]).fillna(0)
 
-
-
+    
     def produce_sclevel(self):
         ctime=time.time()
         extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
@@ -989,7 +984,6 @@ class get_TSS_count():
             with open(extendls_path, 'rb') as f:
                 extendls = pickle.load(f)
 
-
         #transcriptdfls=[]
 
         cellIDls=[]
@@ -998,9 +992,11 @@ class get_TSS_count():
             cellIDls.append(list(cellID))
         cellIDset = set([item for sublist in cellIDls for item in sublist])
 
+        self._final_index = pd.Index(list(cellIDset))  # store once
+        finaldf = pd.DataFrame(index=self._final_index)
 
-        finaldf = pd.DataFrame(index=list(cellIDset))
-        args = [(extendls[i], finaldf.index) for i in range(len(extendls))]
+        with Pool(self.nproc) as pool:
+            results = pool.map(self._build_transcript_column, extendls)
 
         with Pool(self.nproc) as pool:
             results = pool.starmap(self._build_transcript_column, args)
