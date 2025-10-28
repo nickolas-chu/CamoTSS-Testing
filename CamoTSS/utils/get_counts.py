@@ -36,6 +36,12 @@ warnings.filterwarnings("ignore", category=Warning)
 
 
 
+def build_transcript_column(extend_entry, final_index):
+    transcriptid = extend_entry[0]
+    cellID, count = np.unique(extend_entry[1][1], return_counts=True)
+    transcriptdf = pd.DataFrame({'cell_id': cellID, transcriptid: count})
+    transcriptdf.set_index('cell_id', inplace=True)
+    return transcriptid, final_index.map(transcriptdf[transcriptid]).fillna(0)
 
 
 def get_fastq_file(fastqFilePath):
@@ -962,14 +968,7 @@ class get_TSS_count():
 
         return extendls, regiondf
    
-    def _build_transcript_column(self, extend_entry):
-        transcriptid = extend_entry[0]
-        cellID, count = np.unique(extend_entry[1][1], return_counts=True)
-        transcriptdf = pd.DataFrame({'cell_id': cellID, transcriptid: count})
-        transcriptdf.set_index('cell_id', inplace=True)
-        return transcriptid, self._final_index.map(transcriptdf[transcriptid]).fillna(0)
 
-    
     def produce_sclevel(self):
         ctime=time.time()
         extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
@@ -995,8 +994,10 @@ class get_TSS_count():
         self._final_index = pd.Index(list(cellIDset))  # store once
         finaldf = pd.DataFrame(index=self._final_index)
 
+        args = [(entry, self._final_index) for entry in extendls]
         with Pool(self.nproc) as pool:
-            results = pool.map(self._build_transcript_column, extendls)
+            results = pool.starmap(build_transcript_column, args)
+        
 
 
         for transcriptid, col in results:
