@@ -998,8 +998,6 @@ class get_TSS_count():
         with Pool(self.nproc) as pool:
             results = pool.map(self._build_transcript_column, extendls)
 
-        with Pool(self.nproc) as pool:
-            results = pool.starmap(self._build_transcript_column, args)
 
         for transcriptid, col in results:
             finaldf[transcriptid] = col
