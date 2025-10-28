@@ -954,6 +954,10 @@ class get_TSS_count():
         # Save CSV outputs
         extendls_df = pd.DataFrame(extendls, columns=['transcript_id', 'details'])
         extendls_df.to_csv(os.path.join(self.count_out_dir, 'extendls.csv'), index=False)
+        extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
+        with open(extendls_path, 'wb') as f:
+            pickle.dump(extendls, f)
+
         regiondf.to_csv(os.path.join(self.count_out_dir, 'regiondf.csv'))
 
         return extendls, regiondf
@@ -980,12 +984,11 @@ class get_TSS_count():
             extendls, regiondf = self._TSS_annotation()
         else:
             logging.warning("[SCLEVEL] Found existing extendls.csv and regiondf.csv — resuming from saved annotation results.")
-            extendls_df = pd.read_csv(extendls_path)
             regiondf = pd.read_csv(regiondf_path)
-            extendls = list(zip(
-                extendls_df['transcript_id'],
-                extendls_df['details'].apply(lambda x: eval(x, {"array": np.array}))
-            ))  
+            extendls_path = os.path.join(self.count_out_dir, 'extendls.pkl')
+            with open(extendls_path, 'rb') as f:
+                extendls = pickle.load(f)
+
 
         #transcriptdfls=[]
 
