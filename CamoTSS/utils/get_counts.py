@@ -962,10 +962,31 @@ class get_TSS_count():
 
 
 
+    def _build_transcript_column(self, extend_entry, final_index):
+        transcriptid = extend_entry[0]
+        cellID, count = np.unique(extend_entry[1][1], return_counts=True)
+        transcriptdf = pd.DataFrame({'cell_id': cellID, transcriptid: count})
+        transcriptdf.set_index('cell_id', inplace=True)
+        return transcriptid, final_index.map(transcriptdf[transcriptid]).fillna(0)
+
+
 
     def produce_sclevel(self):
         ctime=time.time()
-        extendls,regiondf=self._TSS_annotation()
+        extendls_path = os.path.join(self.count_out_dir, 'extendls.csv')
+        regiondf_path = os.path.join(self.count_out_dir, 'regiondf.csv')
+
+        if not (os.path.exists(extendls_path) and os.path.exists(regiondf_path)):
+            extendls, regiondf = self._TSS_annotation()
+        else:
+            logging.warning("[SCLEVEL] Found existing extendls.csv and regiondf.csv — resuming from saved annotation results.")
+            extendls_df = pd.read_csv(extendls_path)
+            regiondf = pd.read_csv(regiondf_path)
+            extendls = list(zip(
+                extendls_df['transcript_id'],
+                extendls_df['details'].apply(lambda x: eval(x, {"array": np.array}))
+            ))  
+
         #transcriptdfls=[]
 
         cellIDls=[]
@@ -973,17 +994,18 @@ class get_TSS_count():
             cellID=np.unique(extendls[i][1][1])
             cellIDls.append(list(cellID))
         cellIDset = set([item for sublist in cellIDls for item in sublist])
-        finaldf=pd.DataFrame(index=list(cellIDset))
 
 
+        finaldf = pd.DataFrame(index=list(cellIDset))
+        args = [(extendls[i], finaldf.index) for i in range(len(extendls))]
 
-        for i in range(0,len(extendls)):
-            transcriptid=extendls[i][0]       
-            cellID,count=np.unique(extendls[i][1][1],return_counts=True)
-            transcriptdf=pd.DataFrame({'cell_id':cellID,transcriptid:count})
-            transcriptdf.set_index('cell_id',inplace=True)
-            finaldf[transcriptid]=finaldf.index.map(transcriptdf[transcriptid])
+        with Pool(self.nproc) as pool:
+            results = pool.starmap(self._build_transcript_column, args)
 
+        for transcriptid, col in results:
+            finaldf[transcriptid] = col
+
+        logging.warning(f"[SCLEVEL] Finished building transcript matrix with {len(results)} columns.")
 
         finaldf.fillna(0,inplace=True)
         finaldf.to_csv('finaldf.csv')
@@ -1015,14 +1037,14 @@ class get_TSS_count():
             tempdf['diff']=tempdf['TSS_start'].diff()
             keepdf=tempdf[tempdf['diff'].isna()|tempdf['diff'].abs().ge(self.clusterDistance)]    #want to get TSS whose cluster distance is more than user defined.
             #keepdf=keepdf.iloc[:2,:]
-            keepdfls.append(keepdf) 
+            keepdfls.append(keepdf)
 
         #print(keepdfls)
 
 
         allkeepdf=reduce(lambda x,y:pd.concat([x,y]),keepdfls)
-        finaltwodf=allkeepdf[allkeepdf.duplicated('gene_id',keep=False)] 
-        finaltwoadata=adata[:,adata.var.index.isin(finaltwodf['transcript_id'])]  
+        finaltwodf=allkeepdf[allkeepdf.duplicated('gene_id',keep=False)]
+        finaltwoadata=adata[:,adata.var.index.isin(finaltwodf['transcript_id'])]
 
         sc_output_h5ad=self.count_out_dir+'scTSS_count_two.h5ad'
         finaltwoadata.write(sc_output_h5ad)
@@ -1032,6 +1054,9 @@ class get_TSS_count():
 
 
         return adata
+
+
+
 
 
 
