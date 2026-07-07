@@ -9,6 +9,14 @@ import os
 import pandas as pd
 import time 
 
+import logging
+
+# Configure logging before anything else
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler("log.txt"), logging.StreamHandler()]
+)
 
 START_TIME = time.time()
 
