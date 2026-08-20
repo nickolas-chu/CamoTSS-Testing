@@ -8,6 +8,7 @@ import multiprocessing
 import pysam
 from sklearn.cluster import AgglomerativeClustering
 from scipy.optimize import linear_sum_assignment
+from scipy import sparse as sp
 import time
 import random
 import statistics
@@ -996,68 +997,44 @@ class get_TSS_count():
                 extendls = pickle.load(f)
             regiondf = pd.read_csv(regiondf_path)
     
-        # Build final index
+        # Build final index (union of all cells appearing in any transcript entry)
         cellIDls = [list(np.unique(entry[1][1])) for entry in extendls]
         cellIDset = set([item for sublist in cellIDls for item in sublist])
         final_index = pd.Index(list(cellIDset))
-        finaldf = pd.DataFrame(index=final_index)
-    
-        # Save each extend_entry to disk
-        temp_dir = os.path.join(self.count_out_dir, 'temp_extend_entries')
-        os.makedirs(temp_dir, exist_ok=True)
-        paths = []
-    
-        for i, entry in enumerate(extendls):
-            path = os.path.join(temp_dir, f'extend_{i}.pkl')
-            with open(path, 'wb') as f:
-                pickle.dump(entry, f)
-            paths.append(path)
-    
-        logging.warning(f"[SCLEVEL] Saved {len(paths)} extend entries to disk for streaming.")
-    
-        # Dispatch paths to workers
-        from multiprocessing import Pool
-        args = [(path, final_index) for path in paths]
-    
-        with Pool(self.nproc) as pool:
-            results = pool.starmap(build_transcript_column_from_path, args)
-    
-        # Clean up temp files
-        for path in paths:
-            try:
-                os.remove(path)
-            except Exception as e:
-                logging.warning(f"[SCLEVEL] Failed to delete temp file {path}: {type(e).__name__}: {e}")
-        try:
-            os.rmdir(temp_dir)
-        except Exception as e:
-            logging.warning(f"[SCLEVEL] Failed to remove temp directory {temp_dir}: {type(e).__name__}: {e}")
-        
-        logging.warning("[SCLEVEL] Preallocating matrix.")
-        # Preallocate matrix
         n_cells = len(final_index)
-        n_transcripts = len(results)
-        
-        matrix = np.zeros((n_cells, n_transcripts), dtype=np.float32)
-        transcript_ids = []
 
-        
-        logging.warning("[SCLEVEL] Populating finaldf.")
-        for i, result in enumerate(results):
-            if result is not None:
-                transcriptid, col = result
-                matrix[:, i] = col.values
-                transcript_ids.append(transcriptid)
-        
-        # Build DataFrame in one step
-        finaldf = pd.DataFrame(matrix, index=final_index, columns=transcript_ids)
-        
-        logging.warning(f"[SCLEVEL] Finished building transcript matrix with {len(finaldf.columns)} columns.")
-        
-        # Save outputs
-        finaldf.to_csv('finaldf.csv')
-        adata = ad.AnnData(finaldf)
-        adata.write('adata.h5ad')
+        # Build the cell x transcript count matrix directly as a sparse (CSR) matrix.
+        # Numerically identical to the previous dense build (same per-cell np.unique
+        # counts), but avoids materializing an (n_cells x n_transcripts) dense array,
+        # which is infeasible for large cell numbers.
+        logging.warning(f"[SCLEVEL] Building sparse transcript matrix for {n_cells} cells x {len(extendls)} transcripts.")
+        rows = []
+        cols = []
+        data = []
+        transcript_ids = []
+        for j, entry in enumerate(extendls):
+            transcriptid = entry[0]
+            cellID, count = np.unique(entry[1][1], return_counts=True)
+            r = final_index.get_indexer(cellID)
+            rows.append(r)
+            cols.append(np.full(len(r), j, dtype=np.int64))
+            data.append(count.astype(np.float32))
+            transcript_ids.append(transcriptid)
+
+        rows = np.concatenate(rows) if rows else np.zeros(0, dtype=np.int64)
+        cols = np.concatenate(cols) if cols else np.zeros(0, dtype=np.int64)
+        data = np.concatenate(data) if data else np.zeros(0, dtype=np.float32)
+
+        X = sp.coo_matrix((data, (rows, cols)),
+                          shape=(n_cells, len(transcript_ids)),
+                          dtype=np.float32).tocsr()
+
+        adata = ad.AnnData(
+            X=X,
+            obs=pd.DataFrame(index=final_index),
+            var=pd.DataFrame(index=pd.Index(transcript_ids)),
+        )
+        logging.warning(f"[SCLEVEL] Finished sparse transcript matrix with {adata.n_vars} columns, {X.nnz} nonzeros.")
     
         vardf = pd.DataFrame(adata.var.copy())
         vardf.reset_index(inplace=True)
