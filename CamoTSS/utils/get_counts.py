@@ -995,7 +995,10 @@ class get_TSS_count():
             logging.warning("[SCLEVEL] Found existing extendls.pkl and regiondf.csv — resuming from saved annotation results.")
             with open(extendls_path, 'rb') as f:
                 extendls = pickle.load(f)
-            regiondf = pd.read_csv(regiondf_path)
+            # regiondf.csv is written with its row index (to_csv default). Read that column back AS the index;
+            # without index_col=0 pandas makes it a data column, "Unnamed: 0", which the join below then copies
+            # into adata.var (one row number per TSS) on every resumed run.
+            regiondf = pd.read_csv(regiondf_path, index_col=0)
     
         # Build final index (union of all cells appearing in any transcript entry)
         cellIDls = [list(np.unique(entry[1][1])) for entry in extendls]
