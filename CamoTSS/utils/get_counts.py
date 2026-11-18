@@ -23,7 +23,7 @@ import sys
 from sklearn.neighbors import NearestNeighbors
 from multiprocessing import Pool
 from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
-from collections import defaultdict
+from collections import defaultdict, Counter
 class TimeoutException(Exception):
     pass
 
@@ -77,6 +77,32 @@ def _assign_leftover_chunk_bounded(chunk, cluster_bounds, cluster_centroids):
             best_cluster = min(eligible, key=lambda x: x[1])[0]
             results.append((read, best_cluster))
     return results
+
+
+def _leftover_reads(readinfo_full, readinfo_sample):
+    """Return the reads of readinfo_full that were NOT drawn into readinfo_sample, counting copies.
+
+    Each read is stored as (TSS position, cell barcode, CIGAR). Two different molecules from the same
+    cell that start at the same base with the same CIGAR give identical tuples, so a gene's read list
+    holds many exact repeats. The leftover set must therefore be a multiset difference: remove ONE
+    copy from readinfo_full for each sampled read, and keep every other copy.
+
+    The earlier code, [r for r in readinfo_full if tuple(r) not in sampled_set], dropped EVERY copy of
+    any tuple that appeared in the sample, so those extra molecules were never assigned to a cluster
+    and were lost from the counts (only in genes with more than MAX_CLUSTER_READS reads).
+    Example: full = [A, A, A, B], sample = [A]  ->  old leftover = [B], new leftover = [A, A, B].
+    """
+    remaining = Counter(tuple(r) for r in readinfo_sample)
+    leftover = []
+    for r in readinfo_full:
+        t = tuple(r)
+        if remaining[t] > 0:
+            remaining[t] -= 1
+        else:
+            leftover.append(r)
+    # The sample is drawn from readinfo_full, so every sampled read is matched exactly once.
+    assert len(leftover) == len(readinfo_full) - len(readinfo_sample)
+    return leftover
 
 
 class get_TSS_count():
@@ -273,9 +299,8 @@ class get_TSS_count():
                             readinfo_sample.extend([reads[i] for i in sampled])
                             logging.warning(f"Gene {geneid}: sampled {reads_per_replicate} reads from replicate {replicate_id} (condition {condition})")
     
-                # Step 4: Track leftovers
-                sampled_set = set(tuple(r) for r in readinfo_sample)
-                readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
+                # Step 4: Track leftovers (multiset difference: identical reads are separate molecules)
+                readinfo_leftover = _leftover_reads(readinfo_full, readinfo_sample)
                 downsampled = True
             else:
                 readinfo_sample = readinfo_full
@@ -378,8 +403,8 @@ class get_TSS_count():
                             sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
                             readinfo_sample.extend([reads[i] for i in sampled])
     
-                sampled_set = set(tuple(r) for r in readinfo_sample)
-                readinfo_leftover = [r for r in readinfo_full if tuple(r) not in sampled_set]
+                # leftovers: multiset difference (identical reads are separate molecules)
+                readinfo_leftover = _leftover_reads(readinfo_full, readinfo_sample)
                 downsampled = True
             else:
                 readinfo_sample = readinfo_full
