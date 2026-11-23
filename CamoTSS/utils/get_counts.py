@@ -6,7 +6,6 @@ from functools import reduce
 import anndata as ad
 import multiprocessing 
 import pysam
-from sklearn.cluster import AgglomerativeClustering
 from scipy.optimize import linear_sum_assignment
 from scipy import sparse as sp
 import time
@@ -16,6 +15,7 @@ import editdistance
 import warnings
 from pathlib import Path
 from .toolbox import check_pysam_chrom,fetch_reads
+from .distinct_clustering import cluster_gene_reads
 from multiprocessing import get_context
 import logging
 import signal
@@ -64,47 +64,6 @@ def get_fastq_file(fastqFilePath):
     return fastqFile
 
     
-def _assign_leftover_chunk_bounded(chunk, cluster_bounds, cluster_centroids):
-    results = []
-    for read in chunk:
-        read_pos = read[0]
-        eligible = [
-            (idx, abs(read_pos - cluster_centroids[idx]))
-            for idx, (min_, max_) in enumerate(cluster_bounds)
-            if min_ <= read_pos <= max_
-        ]
-        if eligible:
-            best_cluster = min(eligible, key=lambda x: x[1])[0]
-            results.append((read, best_cluster))
-    return results
-
-
-def _leftover_reads(readinfo_full, readinfo_sample):
-    """Return the reads of readinfo_full that were NOT drawn into readinfo_sample, counting copies.
-
-    Each read is stored as (TSS position, cell barcode, CIGAR). Two different molecules from the same
-    cell that start at the same base with the same CIGAR give identical tuples, so a gene's read list
-    holds many exact repeats. The leftover set must therefore be a multiset difference: remove ONE
-    copy from readinfo_full for each sampled read, and keep every other copy.
-
-    The earlier code, [r for r in readinfo_full if tuple(r) not in sampled_set], dropped EVERY copy of
-    any tuple that appeared in the sample, so those extra molecules were never assigned to a cluster
-    and were lost from the counts (only in genes with more than MAX_CLUSTER_READS reads).
-    Example: full = [A, A, A, B], sample = [A]  ->  old leftover = [B], new leftover = [A, A, B].
-    """
-    remaining = Counter(tuple(r) for r in readinfo_sample)
-    leftover = []
-    for r in readinfo_full:
-        t = tuple(r)
-        if remaining[t] > 0:
-            remaining[t] -= 1
-        else:
-            leftover.append(r)
-    # The sample is drawn from readinfo_full, so every sampled read is matched exactly once.
-    assert len(leftover) == len(readinfo_full) - len(readinfo_sample)
-    return leftover
-
-
 class get_TSS_count():
 
 
@@ -256,319 +215,62 @@ class get_TSS_count():
     
 
     def _do_clustering(self, args):
+        """Cluster ALL reads of one gene (no sampling) with CamoTSS's average-linkage rule.
+
+        Uses cluster_gene_reads() (utils/distinct_clustering.py), which gives the same clusters as
+        AgglomerativeClustering(linkage='average', distance_threshold=InnerDistance) run on every read, but works
+        on distinct positions, so time and memory no longer grow with reads squared. This replaces the old
+        20,000-read sample + add-back, which hid TSS, trimmed TSS bounds and depended on the random sample.
+        Returns (geneid, clusters with >= minCount reads), or (geneid, None) on timeout/error.
+        """
         geneid, readinfo_full = args
-        logging.warning(f"Starting clustering for {geneid}")
-        MAX_CLUSTER_READS = 20000
-    
+        logging.warning(f"Starting clustering for {geneid} ({len(readinfo_full)} reads)")
+
         # Set a hard timeout
         def handler(signum, frame):
             raise TimeoutException("Clustering timed out")
         signal.signal(signal.SIGALRM, handler)
         signal.alarm(600)
-    
-        try:
-            downsampled = False
-    
-            # --- Downsampling logic ---
-            if len(readinfo_full) > MAX_CLUSTER_READS:
-                logging.warning(f"Downsampling gene {geneid} from {len(readinfo_full)} to {MAX_CLUSTER_READS} reads")
-    
-                # Step 1: Group reads by condition and replicate
-                condition_groups = defaultdict(lambda: defaultdict(list))
-                for read in readinfo_full:
-                    barcode = read[1]
-                    suffix = barcode.split('-')[-1] if '-' in barcode else 'UNKNOWN'
-                    condition = suffix.split('_')[0]
-                    condition_groups[condition][suffix].append(read)
-    
-                # Step 2: Determine sample size per condition
-                num_conditions = len(condition_groups)
-                reads_per_condition = MAX_CLUSTER_READS // max(num_conditions, 1)
-    
-                # Step 3: Sample evenly across replicates
-                readinfo_sample = []
-                for condition, replicates in condition_groups.items():
-                    num_replicates = len(replicates)
-                    reads_per_replicate = reads_per_condition // max(num_replicates, 1)
-                    for replicate_id, reads in replicates.items():
-                        if len(reads) <= reads_per_replicate:
-                            readinfo_sample.extend(reads)
-                            logging.warning(f"Gene {geneid}: using all {len(reads)} reads from replicate {replicate_id} (condition {condition})")
-                        else:
-                            sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
-                            readinfo_sample.extend([reads[i] for i in sampled])
-                            logging.warning(f"Gene {geneid}: sampled {reads_per_replicate} reads from replicate {replicate_id} (condition {condition})")
-    
-                # Step 4: Track leftovers (multiset difference: identical reads are separate molecules)
-                readinfo_leftover = _leftover_reads(readinfo_full, readinfo_sample)
-                downsampled = True
-            else:
-                readinfo_sample = readinfo_full
-                readinfo_leftover = []
-                downsampled = False
-    
-            # --- Clustering on sample ---
-            posi_sample = np.array([t[0] for t in readinfo_sample]).reshape(-1, 1)
-            CB_sample = np.array([t[1] for t in readinfo_sample]).reshape(-1, 1)
-            cigar_sample = np.array([t[2] for t in readinfo_sample]).reshape(-1, 1)
-    
-            model = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
-            labels_sample = model.fit(posi_sample).labels_
-    
-            # --- Build initial clusters ---
-            altTSSls_raw = []
-            for lbl in np.unique(labels_sample):
-                altTSSls_raw.append([
-                    posi_sample[labels_sample == lbl],
-                    CB_sample[labels_sample == lbl],
-                    cigar_sample[labels_sample == lbl]
-                ])
-    
-            # --- Assign leftover reads to nearest cluster ---
-            if downsampled and len(altTSSls_raw) > 0 and len(readinfo_leftover) > 0:
-    
-                # Compute cluster bounds
-                cluster_bounds = []
-                for cluster in altTSSls_raw:
-                    positions = cluster[0].flatten()
-                    cluster_min = np.min(positions)
-                    cluster_max = np.max(positions)
-                    cluster_bounds.append((cluster_min, cluster_max))
-                
-                # Prepare leftover reads
-                filtered_reads = []
-                for read in readinfo_leftover:
-                    read_pos = read[0]
-                    eligible_clusters = [
-                        idx for idx, (min_, max_) in enumerate(cluster_bounds)
-                        if min_ <= read_pos <= max_
-                    ]
-                    if eligible_clusters:
-                        # Assign to the closest eligible cluster by centroid
-                        centroid_dists = [
-                            (idx, abs(read_pos - altTSSls_raw[idx][0].mean()))
-                            for idx in eligible_clusters
-                        ]
-                        best_cluster = min(centroid_dists, key=lambda x: x[1])[0]
-                        filtered_reads.append((read, best_cluster))
-                
-                # Assign reads
-                for read, lbl_idx in filtered_reads:
-                    altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], read[0]))
-                    altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], read[1]))
-                    altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], read[2]))
 
-    
-            # --- Filter clusters by minCount ---
-            altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
+        try:
+            altTSSls = cluster_gene_reads(readinfo_full, self.InnerDistance, self.minCount)
             signal.alarm(0)
-            logging.warning(f"Gene {geneid}: {len(altTSSls_raw)} raw clusters → {len(altTSSls)} after minCount={self.minCount}")
+            logging.warning(f"Gene {geneid}: {len(altTSSls)} clusters with >= minCount={self.minCount} reads")
             return (geneid, altTSSls)
-    
+
         except TimeoutException:
             logging.error(f"TIMEOUT: Gene {geneid} exceeded 600s")
             return (geneid, None)
         except Exception as e:
+            signal.alarm(0)
             logging.error(f"FAILED: Gene {geneid} - {type(e).__name__}: {e}")
             return (geneid, None)
 
-    # New helper: sample-only clustering (no inner Pool)
-    def _do_clustering_sample(self, args):
-        geneid, readinfo_full = args
-        logging.warning(f"[SAMPLE] Starting sample clustering for {geneid} with {len(readinfo_full)} reads")
-        try:
-            MAX_CLUSTER_READS = 20000
-            from collections import defaultdict
-    
-            # --- Downsampling logic (same as before) ---
-            if len(readinfo_full) > MAX_CLUSTER_READS:
-                condition_groups = defaultdict(lambda: defaultdict(list))
-                for read in readinfo_full:
-                    barcode = read[1]
-                    suffix = barcode.split('-')[-1] if '-' in barcode else 'UNKNOWN'
-                    condition = suffix.split('_')[0]
-                    condition_groups[condition][suffix].append(read)
-    
-                num_conditions = len(condition_groups)
-                reads_per_condition = MAX_CLUSTER_READS // max(num_conditions, 1)
-    
-                readinfo_sample = []
-                for condition, replicates in condition_groups.items():
-                    num_replicates = len(replicates)
-                    reads_per_replicate = reads_per_condition // max(num_replicates, 1)
-                    for replicate_id, reads in replicates.items():
-                        if len(reads) <= reads_per_replicate:
-                            readinfo_sample.extend(reads)
-                        else:
-                            sampled = np.random.choice(len(reads), reads_per_replicate, replace=False)
-                            readinfo_sample.extend([reads[i] for i in sampled])
-    
-                # leftovers: multiset difference (identical reads are separate molecules)
-                readinfo_leftover = _leftover_reads(readinfo_full, readinfo_sample)
-                downsampled = True
-            else:
-                readinfo_sample = readinfo_full
-                readinfo_leftover = []
-                downsampled = False
-    
-            # --- Clustering on sample (same as before) ---
-            posi_sample = np.array([t[0] for t in readinfo_sample]).reshape(-1, 1)
-            CB_sample = np.array([t[1] for t in readinfo_sample]).reshape(-1, 1)
-            cigar_sample = np.array([t[2] for t in readinfo_sample]).reshape(-1, 1)
-    
-            model = AgglomerativeClustering(n_clusters=None, linkage='average', distance_threshold=self.InnerDistance)
-            labels_sample = model.fit(posi_sample).labels_
-    
-            altTSSls_raw = []
-            for lbl in np.unique(labels_sample):
-                altTSSls_raw.append([
-                    posi_sample[labels_sample == lbl],
-                    CB_sample[labels_sample == lbl],
-                    cigar_sample[labels_sample == lbl]
-                ])
-    
-            # compute cluster metadata and leftover-chunk descriptors that the main process will use
-            cluster_bounds = []
-            cluster_centroids = []
-            for cluster in altTSSls_raw:
-                positions = cluster[0].flatten()
-                cluster_bounds.append((np.min(positions), np.max(positions)))
-                cluster_centroids.append(np.mean(positions))
-    
-            # chunk leftovers into descriptors (do not assign here)
-            CHUNK_SIZE = 10000
-            chunks = [readinfo_leftover[i:i + CHUNK_SIZE] for i in range(0, len(readinfo_leftover), CHUNK_SIZE)]
-            logging.warning(f"[SAMPLE] Finished sample clustering for {geneid} with {len(readinfo_full)} reads")
-            # return everything needed by main thread to submit chunk tasks
-            return {
-                "geneid": geneid,
-                "altTSSls_raw": altTSSls_raw,
-                "downsampled": downsampled,
-                "cluster_bounds": cluster_bounds,
-                "cluster_centroids": cluster_centroids,
-                "chunks": chunks
-            }
-    
-        except Exception as e:
-            logging.error(f"[SAMPLE] FAILED: Gene {geneid} - {type(e).__name__}: {e}")
-            return {"geneid": geneid, "error": True}
-    
-    
-    # Updated recovery that uses a single shared chunk Pool
+
     def _recover_failed_genes_parallel(self, failed_genes, readinfodict, altTSSdict):
+        """Retry genes that failed or timed out in the main clustering pass, one at a time.
+
+        The old recovery re-clustered a 20,000-read sample and added leftover reads back in a chunk pool. Clustering
+        no longer samples, so recovery simply runs the same all-reads clustering again (without parallel workers),
+        keeping the checkpoint / resume behaviour.
+        """
         recovered = 0
-        gene_nproc = 2  # how many sample-clustering gene workers run concurrently
-        total_cores = max(1, int(self.nproc))
-        # allocate remaining cores to the shared chunk pool (at least 1)
-        chunk_pool_procs = max(1, total_cores - gene_nproc)
-    
-        args = [(geneid, readinfodict.get(geneid)) for geneid in failed_genes if readinfodict.get(geneid)]
-        skipped = [geneid for geneid in failed_genes if not readinfodict.get(geneid)]
-        for geneid in skipped:
-            logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
-    
-        # create a shared chunk Pool in the main process (spawn start)
-        ctx = get_context("spawn")
-        chunk_pool = ctx.Pool(processes=chunk_pool_procs)
-    
-        try:
-            # Phase A: run sample clustering in parallel (no nested pools)
-            with ProcessPoolExecutor(max_workers=gene_nproc) as executor:
-                sample_futures = {executor.submit(self._do_clustering_sample, arg): arg[0] for arg in args}
-    
-                # as each gene sample finishes, submit its chunk tasks to the shared chunk_pool
-                for future in as_completed(sample_futures):
-                    geneid = sample_futures[future]
-                    logging.warning(f"Returned sample clustering for {geneid}")
-                    try:
-                        sample_res = future.result(timeout=1200)
-                    except Exception as e:
-                        logging.error(f"[RECOVERY] Sample clustering failed for {geneid}: {type(e).__name__}: {e}")
-                        continue
-    
-                    if sample_res.get("error"):
-                        logging.warning(f"[RECOVERY] Sample clustering returned error for {geneid}, skipping.")
-                        continue
-    
-                    # get items returned
-                    geneid = sample_res["geneid"]
-                    altTSSls_raw = sample_res["altTSSls_raw"]
-                    downsampled = sample_res["downsampled"]
-                    cluster_bounds = sample_res["cluster_bounds"]
-                    cluster_centroids = sample_res["cluster_centroids"]
-                    chunks = sample_res["chunks"]
-    
-                    # if nothing to do, finalize gene immediately
-                    if not (downsampled and len(altTSSls_raw) > 0 and len(chunks) > 0):
-                        # just filter clusters by minCount and save
-                        altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
-                        altTSSdict[geneid] = altTSSls
-                        recovered += 1
-                        if geneid in failed_genes:
-                            failed_genes.remove(geneid)
-                        logging.warning(f"[RECOVERY] Gene {geneid} required no chunk assignment, saved {len(altTSSls)} clusters.")
-                        continue
-    
-                    # submit chunk tasks to shared pool
-                    logging.warning(f"[RECOVERY] Submitting {len(chunks)} chunks for gene {geneid} to shared chunk pool "
-                                    f"(bounds={len(cluster_bounds)}, procs={chunk_pool_procs})")
-    
-                    # use starmap_async to assign each chunk; pass cluster_bounds + centroids as immutable arguments
-                    task_iter = [(chunk, cluster_bounds, cluster_centroids) for chunk in chunks]
-                    async_result = chunk_pool.starmap_async(_assign_leftover_chunk_bounded, task_iter)
-    
-                    # wait for chunk assignment to complete (optionally add a timeout)
-                    try:
-                        logging.warning(f"[RECOVERY] Waiting for chunk assignment to complete for {geneid}")
-                        assigned_chunks = async_result.get(timeout=1800)  # adjust timeout as needed
-                        logging.warning(f"[RECOVERY] Chunk assignment completed for {geneid}")
-                    except Exception as e:
-                        logging.error(f"[RECOVERY] Chunk assignment failed/timeout for gene {geneid}: {type(e).__name__}: {e}")
-                        continue
-    
-                    # merge assigned_chunks into altTSSls_raw
-                    # Step 1: collect reads per cluster label
-                    cluster_batches = defaultdict(list)
-                    for chunk_res in assigned_chunks:
-                        for read, lbl_idx in chunk_res:
-                            cluster_batches[lbl_idx].append(read)
+        for geneid in list(failed_genes):
+            readinfo = readinfodict.get(geneid)
+            if not readinfo:
+                logging.warning(f"[RECOVERY] No readinfo found for {geneid}, skipping.")
+                continue
+            geneid, altTSSls = self._do_clustering((geneid, readinfo))
+            if altTSSls is None:
+                logging.error(f"[RECOVERY] Gene {geneid} failed again.")
+                continue
+            altTSSdict[geneid] = altTSSls
+            failed_genes.remove(geneid)
+            recovered += 1
+            logging.warning(f"[RECOVERY] Successfully recovered gene {geneid}: {len(altTSSls)} clusters saved.")
 
-                    # Step 2: stack all reads per cluster in one go
-                    logging.warning(f"[MERGE] Begin chunk stacking for {geneid}")
-                    for lbl_idx, reads in cluster_batches.items():
-                        try:
-                            posi_stack = np.vstack([r[0] for r in reads])
-                            CB_stack = np.vstack([r[1] for r in reads])
-                            cigar_stack = np.vstack([r[2] for r in reads])
-
-                            altTSSls_raw[lbl_idx][0] = np.vstack((altTSSls_raw[lbl_idx][0], posi_stack))
-                            altTSSls_raw[lbl_idx][1] = np.vstack((altTSSls_raw[lbl_idx][1], CB_stack))
-                            altTSSls_raw[lbl_idx][2] = np.vstack((altTSSls_raw[lbl_idx][2], cigar_stack))
-                        except Exception as e:
-                            logging.error(f"[MERGE] Failed to stack cluster {lbl_idx}: {type(e).__name__}: {e}")
-    
-                    # Filter clusters by minCount and save
-                    altTSSls = [c for c in altTSSls_raw if c[0].shape[0] >= self.minCount]
-                    altTSSdict[geneid] = altTSSls
-                    recovered += 1
-                    if geneid in failed_genes:
-                        failed_genes.remove(geneid)
-                    logging.warning(f"[RECOVERY] Successfully recovered gene {geneid}: {len(altTSSls)} clusters saved.")
-    
-                    # periodic checkpointing can be done here if desired
-                    # self._save_recovery_checkpoint(altTSSdict, failed_genes)  # optionally call
-    
-        finally:
-            # ensure we always close the shared chunk pool
-            try:
-                chunk_pool.close()
-                chunk_pool.join()
-            except Exception:
-                pass
-    
-        # final checkpoint and failure handling (preserve your original behavior)
         self._save_recovery_checkpoint(altTSSdict, failed_genes, final=True)
-    
+
         if failed_genes:
             logging.warning(f"Still failed after recovery: {len(failed_genes)} genes")
             for gid in failed_genes:
@@ -576,8 +278,8 @@ class get_TSS_count():
             print("Clustering halted due to unrecoverable genes. See log.txt for details.")
             sys.exit(1)
         else:
-            logging.warning(f"Recovered {recovered} genes using parallel recovery.")
-    
+            logging.warning(f"Recovered {recovered} genes.")
+
         return altTSSdict
 
 
@@ -1107,6 +809,10 @@ class get_TSS_count():
 
 
     def window_sliding(self,genereads,TSS_start,TSS_end,strand):
+        # --mode TC+CTSS window (unchanged): only bases that HAVE unencoded-G reads are positions, so a window is
+        # windowSize consecutive read-bearing bases (it can span far more than windowSize bp). This differs from
+        # --mode CTSS (get_ctss.py), which counts every base including empty ones, so the two modes can call
+        # different CTSS from the same data.
 
         leftIndex=0
 
@@ -1156,149 +862,17 @@ class get_TSS_count():
 
 
 
-    def _get_CTSS(self,fetchadata):
-        oneclusterfilePath=self.count_out_dir+'afterfiltered.csv'
-        alloneclusterdf=pd.read_csv(oneclusterfilePath)
-        alloneclusterdf['gene_id']=alloneclusterdf['Unnamed: 0'].str.split('*',expand=True)[0]
-        alloneclusterdf['TSS_start']=alloneclusterdf['Unnamed: 0'].str.split('*',expand=True)[1].str.split('_',expand=True)[0].astype('float')
-        alloneclusterdf['TSS_end']=alloneclusterdf['Unnamed: 0'].str.split('_',expand=True)[1].astype('float')
-
-        self.generefdf.reset_index(inplace=True)
-        
-
-        #print(self.generefdf)
-        stranddf=self.generefdf[['Strand','gene_id']]
-        alloneclusterdf=alloneclusterdf.merge(stranddf,on='gene_id')
-
-
-
-
-        start_time=time.time()
-
-        allsortfddict={}
-
-        for i in range(0,len(alloneclusterdf)):
-            geneID=alloneclusterdf['gene_id'][i]
-            # print(geneID)
-            genereads=fetchadata[geneID]
-            clusterID=alloneclusterdf['Unnamed: 0'][i]
-            TSS_start=alloneclusterdf['TSS_start'][i]
-            TSS_end=alloneclusterdf['TSS_end'][i]
-            strand=alloneclusterdf['Strand'][i]
-            windowreturn=self.window_sliding(genereads,TSS_start,TSS_end,strand)
-            allsortfddict[clusterID]=windowreturn
-
-
-        print('window sliding Time elapsed',int(time.time()-start_time),'seconds.')
-
-        
-        ctssOutPath=self.ctss_out_dir+'CTSS_foldchange.pkl'
-        with open(ctssOutPath,'wb') as f:
-            pickle.dump(allsortfddict,f)
-
-        return allsortfddict
-
-
-    def pickCTSS(self,ctssls):
-
-        keepCTSS=[]
-        for ele in ctssls:
-            if (ele[1]>self.minCTSSCount)&(ele[2]>self.minFC):
-                keepCTSS.append(ele)
-        return keepCTSS
-    
-
-
-
-
-
     def produce_CTSS_adata(self):
-        ctime=time.time()
+        """--mode TC+CTSS: CTSS inside every kept TSS cluster, with this mode's window_sliding() (unchanged).
 
-
+        Shares the data handling with --mode CTSS (utils/get_ctss.py build_ctss_adata): reads come from keepdict.pkl
+        instead of the whole fetch_reads.pkl, cells per CTSS are found with numpy, and the matrix is sparse.
+        """
+        from .get_ctss import load_kept_cluster_reads, build_ctss_adata
         self.ctss_out_dir=str(self.outdir)+'/CTSS/'
         if not os.path.exists(self.ctss_out_dir):
             os.mkdir(self.ctss_out_dir)
-
-
-
-
-
-
-        readspath=self.count_out_dir+'fetch_reads.pkl'
-        with open(readspath,'rb') as f:
-            fetchadata=pickle.load(f)
-
-        allsortfddict=self._get_CTSS(fetchadata)
-        keepdict={}
-        for ctssid in allsortfddict.keys():
-            keepdict[ctssid]=self.pickCTSS(allsortfddict[ctssid])
-        
-        #print(keepdict)
-
-
-        #get the cellID meeting our requirement
-        cellIDdict={}
-        for i in keepdict.keys():
-            
-            for j in keepdict[i]:
-                geneid=i.split('*')[0]
-                newid=i+'#'+str(j[0])+'@'+str(j[1])+'$'+str(j[2])
-                cellIDls=[]
-                for ele in fetchadata[geneid]:
-                    if j[0]==ele[0]:
-                        cellIDls.append(ele[1])
-                cellIDdict[newid]=cellIDls
-
-        #print(len(cellIDdict))
-
-
-        #create a big matrix including cell ID
-        cellidls=list(cellIDdict.values())
-        cellidset = list(set([item for sublist in cellidls for item in sublist]))
-        ctssfinaldf=pd.DataFrame(index=cellidset)
-
-
-
-        
-        for clusterID in cellIDdict.keys():
-            cellID,count=np.unique(cellIDdict[clusterID],return_counts=True)
-            CTSSdf=pd.DataFrame({'cell_id':cellID,clusterID:count})
-            CTSSdf.set_index('cell_id',inplace=True)
-            ctssfinaldf[clusterID]=ctssfinaldf.index.map(CTSSdf[clusterID])
-
-
-        ctssfinaldf.fillna(0,inplace=True)
-        #print(ctssfinaldf)
-        ctssadata=ad.AnnData(ctssfinaldf)
-
-        ctssvardf=pd.DataFrame(ctssadata.var.copy())
-        ctssvardf.reset_index(inplace=True)
-        ctssvardf.columns=['clusterID']
-        ctssvardf['gene_id']=ctssvardf['clusterID'].str.split('*',expand=True)[0]
-        ctssvardf['CTSS']=ctssvardf['clusterID'].str.split('#',expand=True)[1].str.split('@',expand=True)[0]
-        ctssvardf['counts_dropped_UnencodedG']=ctssvardf['clusterID'].str.split('@',expand=True)[1].str.split('$',expand=True)[0]
-        ctssvardf['fold_change']=ctssvardf['clusterID'].str.split('$',expand=True)[1]
-
-
-        ctssvardf=ctssvardf.merge(self.generefdf,on='gene_id')
-        ctssvardf.set_index('clusterID',drop=True,inplace=True)
-        ctssadata.var=ctssvardf
-
-        ctss_output_h5ad=self.ctss_out_dir+'all_ctss.h5ad'
-        ctssadata.write(ctss_output_h5ad)
-
-
-        twoctssselect=ctssadata.var[ctssadata.var.duplicated('gene_id',keep=False)].index
-        twoctssadata=ctssadata[:,twoctssselect]
-
-        sc_output_h5ad=self.ctss_out_dir+'all_ctss_two.h5ad'
-        twoctssadata.write(sc_output_h5ad)
-
-        print('produce CTSS h5ad Time elapsed',int(time.time()-ctime),'seconds.')
-
-
-        return twoctssadata
-
-
-
+        clusters = load_kept_cluster_reads(self.count_out_dir)
+        alloneclusterdf = pd.read_csv(self.count_out_dir+'afterfiltered.csv')
+        return build_ctss_adata(clusters, alloneclusterdf, self.generefdf, self.window_sliding,
+                                self.minCTSSCount, self.minFC, self.ctss_out_dir)
