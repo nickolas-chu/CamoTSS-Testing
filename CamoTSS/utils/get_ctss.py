@@ -18,8 +18,13 @@ warnings.filterwarnings("ignore", category=Warning)
 # Shared CTSS (single-base TSS) machinery, used by BOTH modes:
 #   --mode CTSS     -> get_CTSS_count.produce_CTSS_adata()                   (this file)
 #   --mode TC+CTSS  -> get_TSS_count.produce_CTSS_adata() in get_counts.py
-# Each mode keeps its own window_sliding() unchanged (the two differ; see the notes on each), so the CTSS each mode
-# reports is the same as before. What changed (2026-11-23), all without changing which CTSS are called or their counts:
+# Changes 2026-11-23:
+#   * ONE sliding window for both modes: window_sliding() below = the old --mode CTSS window (every base counts, bases
+#     without reads count 0, so a window is windowSize consecutive bases) with one fix: the cluster's LAST base is now
+#     included (the old code used range(TSS_start, TSS_end), which stopped one base short; a cluster's edge base always
+#     carries reads). The old --mode TC+CTSS window used only bases that HAVE reads, so its 15 "positions" could span
+#     hundreds of bp and its last 14 read-bearing bases could never be tested; the two modes called different CTSS from
+#     the same data (human: 805 vs 341 CTSS; with the last-base fix 849).
 #   * reads come from keepdict.pkl (the reads of each kept TSS cluster) instead of loading the whole fetch_reads.pkl.
 #     Clustering now uses ALL reads (distinct_clustering.py), so a kept cluster holds exactly every read of its gene
 #     inside [TSS_start, TSS_end] -- the same reads the old code selected from fetch_reads.pkl -- at a fraction of
@@ -30,9 +35,61 @@ warnings.filterwarnings("ignore", category=Warning)
 #     for every CTSS.
 #   * the cell x CTSS matrix is built sparse (CSR, float32), like scTSS_count_all.h5ad, instead of a dense pandas
 #     DataFrame filled one column at a time. Same numbers; cells (obs) are sorted instead of in random set order.
-#   * CTSS_foldchange.pkl is reused when present (resume after a crash), like the cluster-mode checkpoints.
+#   * CTSS_foldchange.pkl is reused on a rerun (resume after a crash) ONLY if CTSS_foldchange_params.txt shows it was
+#     made with the same window settings; otherwise it is recomputed.
 #   * var no longer gets a meaningless 'index' column (generefdf.reset_index() was copied into var on every run).
 # ----------------------------------------------------------------------------------------------------------------------
+
+WINDOW_VERSION = "consecutive-bases-incl-last-base-v1"     # written next to CTSS_foldchange.pkl; change if the window changes
+
+
+def window_sliding(genereads, TSS_start, TSS_end, strand, windowSize):
+    """Fold change of every base of one TSS cluster against the windowSize bases downstream of it.
+
+    genereads : list of (position, barcode, CIGAR) reads of the cluster; only reads with an unencoded G (CIGAR soft clip
+                14S/15S/16S) are used here
+    Every base from TSS_start to TSS_end INCLUSIVE is a position; bases without unencoded-G reads count 0. Bases are
+    ordered along transcription (ascending on '+', descending on '-'), and for each base
+        fold change = (reads at the base + 1) / (mean reads over the base and the next windowSize-1 bases + 1)
+    Returns [[base, unencoded-G reads at the base, fold change], ...] sorted by fold change, highest first. As before,
+    the last windowSize-1 bases of the cluster (downstream end) have no full window and are not scored.
+    """
+    leftIndex = 0
+    filterls = [i for i in genereads if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2])]
+
+    # unencoded-G read count at each base
+    promoterTSS = [read[0] for read in filterls if (read[0] >= TSS_start) and (read[0] <= TSS_end)]
+    TSS, count = np.unique(promoterTSS, return_counts=True)
+
+    originaldf = pd.DataFrame({'count': count}, index=TSS)
+    desireddf = pd.DataFrame({'count': 0}, index=[i for i in range(int(TSS_start), int(TSS_end) + 1)])   # + 1: last base
+    desireddf['count'] = desireddf.index.map(originaldf['count']).fillna(0)
+    desireddf.reset_index(inplace=True)
+    nonzeroarray = np.array(desireddf)
+
+    if strand == '+':
+        sortfinalarray = nonzeroarray[nonzeroarray[:, 0].argsort()]
+    elif strand == '-':
+        sortfinalarray = nonzeroarray[nonzeroarray[:, 0].argsort()[::-1]]
+
+    TSS = sortfinalarray.T[0]
+    count = sortfinalarray.T[1]
+
+    # sliding window
+    storels = []
+    for i in range(len(TSS) - windowSize + 1):
+        onewindow = TSS[i: i + windowSize]
+        correspondingcount = count[i: i + windowSize]
+        middlecount = correspondingcount[leftIndex]
+        foldchange = (middlecount + 1) / (sum(correspondingcount) / len(correspondingcount) + 1)
+        storels.append([onewindow[leftIndex], correspondingcount[leftIndex], foldchange])
+
+    foldchangels = [i[2] for i in storels]
+    sortindex = sorted(range(len(foldchangels)), key=lambda k: foldchangels[k], reverse=True)
+    allsortls = [storels[i] for i in sortindex]
+
+    return allsortls
+
 
 def load_kept_cluster_reads(count_out_dir):
     """Reads of every kept TSS cluster, keyed by the cluster name used in afterfiltered.csv ('gene*start_end').
@@ -57,15 +114,13 @@ def pick_ctss(ctssls, minCTSSCount, minFC):
     return [ele for ele in ctssls if (ele[1] > minCTSSCount) & (ele[2] > minFC)]
 
 
-def build_ctss_adata(clusters, alloneclusterdf, generefdf, window_sliding, minCTSSCount, minFC, ctss_out_dir):
+def build_ctss_adata(clusters, alloneclusterdf, generefdf, windowSize, minCTSSCount, minFC, ctss_out_dir):
     """Detect CTSS inside every kept TSS cluster and write all_ctss.h5ad and all_ctss_two.h5ad.
 
     clusters        : output of load_kept_cluster_reads()
     alloneclusterdf : afterfiltered.csv read with pd.read_csv (cluster name in column 'Unnamed: 0')
     generefdf       : ref_gene.tsv as a DataFrame (needs 'gene_id' and 'Strand')
-    window_sliding  : the mode's sliding-window function, called as window_sliding(reads, TSS_start, TSS_end, strand)
-                      with reads = list of (position, barcode, CIGAR); returns [[CTSS, unencoded-G count, fold change]]
-                      sorted by fold change
+    windowSize      : bases per sliding window (--windowSize, default 15)
     """
     ctime = time.time()
     df = alloneclusterdf.copy()
@@ -74,10 +129,14 @@ def build_ctss_adata(clusters, alloneclusterdf, generefdf, window_sliding, minCT
     df['TSS_end'] = df['Unnamed: 0'].str.split('_', expand=True)[1].astype('float')
     df = df.merge(generefdf[['Strand', 'gene_id']], on='gene_id').reset_index(drop=True)
 
-    # --- step 1: sliding-window fold change inside every kept cluster (reuse the saved result on a rerun) ---
+    # --- step 1: sliding-window fold change inside every kept cluster ---
+    # On a rerun the saved CTSS_foldchange.pkl is reused only if it was made with the same window settings.
     ctssOutPath = os.path.join(ctss_out_dir, 'CTSS_foldchange.pkl')
-    if os.path.exists(ctssOutPath):
-        logging.warning("[CTSS] Found existing CTSS_foldchange.pkl -- resuming from it.")
+    paramsPath = os.path.join(ctss_out_dir, 'CTSS_foldchange_params.txt')
+    params = f"window={WINDOW_VERSION} windowSize={windowSize} clusters={len(df)}"
+    saved = open(paramsPath).read().strip() if os.path.exists(paramsPath) else None
+    if os.path.exists(ctssOutPath) and saved == params:
+        logging.warning("[CTSS] Found CTSS_foldchange.pkl made with the same settings -- resuming from it.")
         with open(ctssOutPath, 'rb') as f:
             allsortfddict = pickle.load(f)
     else:
@@ -87,10 +146,13 @@ def build_ctss_adata(clusters, alloneclusterdf, generefdf, window_sliding, minCT
             clusterID = df['Unnamed: 0'][i]
             pos, cb, cigar = clusters[clusterID]
             genereads = list(zip(pos.tolist(), cb.tolist(), cigar.tolist()))
-            allsortfddict[clusterID] = window_sliding(genereads, df['TSS_start'][i], df['TSS_end'][i], df['Strand'][i])
+            allsortfddict[clusterID] = window_sliding(genereads, df['TSS_start'][i], df['TSS_end'][i], df['Strand'][i],
+                                                      windowSize)
         print('window sliding Time elapsed', int(time.time() - start_time), 'seconds.')
         with open(ctssOutPath, 'wb') as f:
             pickle.dump(allsortfddict, f)
+        with open(paramsPath, 'w') as f:
+            f.write(params + '\n')
 
     # --- step 2: keep CTSS passing the count / fold-change filters; collect the cells of each kept CTSS ---
     col_ids, col_cells, col_counts = [], [], []
@@ -148,62 +210,10 @@ class get_CTSS_count():
 
 
 
-    def window_sliding(self,genereads,TSS_start,TSS_end,strand):
-        # --mode CTSS window (unchanged): every base from TSS_start to TSS_end - 1 is a position, including bases with
-        # no read (count 0), so a window is windowSize consecutive BASES. Note: range(TSS_start, TSS_end) stops one base
-        # short of TSS_end, so reads on the cluster's last base are never considered.
-
-
-        leftIndex=0
-        filterls=[i for i in genereads if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2])  ]
-        #print("the pid of current process：",os.getpid())
-
-        #calculate the TSS position and corresponding counts
-        promoterTSS = [read[0] for read in filterls if (read[0] >= TSS_start) and (read[0] <= TSS_end)]
-        TSS,count=np.unique(promoterTSS,return_counts=True)
-
-
-
-        originaldf=pd.DataFrame({'count':count},index=TSS)
-        desireddf=pd.DataFrame({'count':0},index=[i for i in range(int(TSS_start),int(TSS_end))])
-        desireddf['count']=desireddf.index.map(originaldf['count']).fillna(0)
-        desireddf.reset_index(inplace=True)
-        nonzeroarray=np.array(desireddf)
-
-
-        if strand=='+':
-            sortfinalarray=nonzeroarray[nonzeroarray[:, 0].argsort()]
-        elif strand=='-':
-            sortfinalarray=nonzeroarray[nonzeroarray[:, 0].argsort()[::-1]]
-
-        TSS=sortfinalarray.T[0]
-        count=sortfinalarray.T[1]
-
-
-        #do something with sliding windows algorithm
-        storels=[]
-        for i in range(len(TSS) - self.windowSize + 1):
-            #print(i)
-            onewindow=TSS[i: i + self.windowSize]
-            correspondingcount=count[i: i + self.windowSize]
-            middlecount=correspondingcount[leftIndex]
-            foldchange=(middlecount+1)/(sum(correspondingcount)/len(correspondingcount)+1)
-            storels.append([onewindow[leftIndex],correspondingcount[leftIndex],foldchange])
-
-
-        foldchangels=[i[2] for i in storels]
-        sortindex=sorted(range(len(foldchangels)), key=lambda k: foldchangels[k],reverse=True)
-        allsortls=[storels[i] for i in sortindex]
-
-        return allsortls
-
-
-
-
     def produce_CTSS_adata(self):
         self.ctss_out_dir=os.path.join(self.out_dir+'/CTSS/')
         if not os.path.exists(self.ctss_out_dir):
             os.mkdir(self.ctss_out_dir)
         clusters = load_kept_cluster_reads(os.path.join(self.out_dir, 'count'))
-        return build_ctss_adata(clusters, self.alloneclusterdf, self.generefdf, self.window_sliding,
+        return build_ctss_adata(clusters, self.alloneclusterdf, self.generefdf, self.windowSize,
                                 self.minCTSSCount, self.minFC, self.ctss_out_dir)

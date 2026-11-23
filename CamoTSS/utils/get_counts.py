@@ -808,65 +808,12 @@ class get_TSS_count():
 
 
 
-    def window_sliding(self,genereads,TSS_start,TSS_end,strand):
-        # --mode TC+CTSS window (unchanged): only bases that HAVE unencoded-G reads are positions, so a window is
-        # windowSize consecutive read-bearing bases (it can span far more than windowSize bp). This differs from
-        # --mode CTSS (get_ctss.py), which counts every base including empty ones, so the two modes can call
-        # different CTSS from the same data.
-
-        leftIndex=0
-
-        # do filtering; drop reads which does not include unencoded G
-        filterls=[]
-        for i in genereads:
-            if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2]):
-                filterls.append(i)
-
-
-        #calculate the TSS position and corresponding counts
-        promoterTSS=[]
-        for read in filterls:
-            tss=read[0]
-            if (tss>=TSS_start)&(tss<=TSS_end):
-                promoterTSS.append(tss)
-        TSS,count=np.unique(promoterTSS,return_counts=True)
-
-        nonzeroarray=np.asarray((TSS, count)).T
-
-
-        if strand=='+':
-            sortfinalarray=nonzeroarray[nonzeroarray[:, 0].argsort()]
-            TSS=sortfinalarray.T[0]
-            count=sortfinalarray.T[1]
-        elif strand=='-':
-            sortfinalarray=nonzeroarray[nonzeroarray[:, 0].argsort()[::-1]]
-            TSS=sortfinalarray.T[0]
-            count=sortfinalarray.T[1]
-
-
-        #do something with sliding windows algorithm   
-        storels=[]
-        for i in range(len(TSS) - self.windowSize + 1):
-            #print(i)
-            onewindow=TSS[i: i + self.windowSize]
-            correspondingcount=count[i: i + self.windowSize]
-            middlecount=correspondingcount[leftIndex]
-            foldchange=(middlecount+1)/(sum(correspondingcount)/len(correspondingcount)+1)
-            storels.append([onewindow[leftIndex],correspondingcount[leftIndex],foldchange])
-            
-        foldchangels=[i[2] for i in storels]
-        sortindex=sorted(range(len(foldchangels)), key=lambda k: foldchangels[k],reverse=True)
-        allsortls=[storels[i] for i in sortindex]
-
-        return allsortls
-
-
-
     def produce_CTSS_adata(self):
-        """--mode TC+CTSS: CTSS inside every kept TSS cluster, with this mode's window_sliding() (unchanged).
+        """--mode TC+CTSS: CTSS inside every kept TSS cluster.
 
-        Shares the data handling with --mode CTSS (utils/get_ctss.py build_ctss_adata): reads come from keepdict.pkl
-        instead of the whole fetch_reads.pkl, cells per CTSS are found with numpy, and the matrix is sparse.
+        Same code as --mode CTSS (utils/get_ctss.py build_ctss_adata + window_sliding): one sliding window for both
+        modes (windowSize consecutive bases, cluster's last base included), reads from keepdict.pkl instead of the whole
+        fetch_reads.pkl, cells per CTSS found with numpy, sparse matrix.
         """
         from .get_ctss import load_kept_cluster_reads, build_ctss_adata
         self.ctss_out_dir=str(self.outdir)+'/CTSS/'
@@ -874,5 +821,5 @@ class get_TSS_count():
             os.mkdir(self.ctss_out_dir)
         clusters = load_kept_cluster_reads(self.count_out_dir)
         alloneclusterdf = pd.read_csv(self.count_out_dir+'afterfiltered.csv')
-        return build_ctss_adata(clusters, alloneclusterdf, self.generefdf, self.window_sliding,
+        return build_ctss_adata(clusters, alloneclusterdf, self.generefdf, self.windowSize,
                                 self.minCTSSCount, self.minFC, self.ctss_out_dir)
