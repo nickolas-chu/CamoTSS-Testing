@@ -25,10 +25,10 @@ warnings.filterwarnings("ignore", category=Warning)
 #     carries reads). The old --mode TC+CTSS window used only bases that HAVE reads, so its 15 "positions" could span
 #     hundreds of bp and its last 14 read-bearing bases could never be tested; the two modes called different CTSS from
 #     the same data (human: 805 vs 341 CTSS; with the last-base fix 849).
-#   * reads come from keepdict.pkl (the reads of each kept TSS cluster) instead of loading the whole fetch_reads.pkl.
-#     Clustering now uses ALL reads (distinct_clustering.py), so a kept cluster holds exactly every read of its gene
-#     inside [TSS_start, TSS_end] -- the same reads the old code selected from fetch_reads.pkl -- at a fraction of
-#     the memory (human: 8% of reads are in kept clusters).
+#   * each kept cluster's reads (every read of its gene inside [TSS_start, TSS_end], the same reads the old code
+#     selected from fetch_reads.pkl) are read one cluster at a time from the read store (count/fetch_reads_store,
+#     read_store.py) instead of loading the whole fetch_reads.pkl. For output folders made by earlier versions of the
+#     fork (no store), keepdict.pkl is used instead.
 #     NOTE: for an output folder made by the OLD sampled clustering, keepdict.pkl misses some reads inside the bounds
 #     (the 20,000-read sample + add-back), so CTSS mode on such a folder can give lower counts than before.
 #   * cells at each CTSS are found with one numpy comparison per cluster, not a Python loop over every read of the gene
@@ -107,6 +107,34 @@ def load_kept_cluster_reads(count_out_dir):
             clusters[name] = (c[0].ravel(), c[1].ravel(), c[2].ravel())
     del keepdict
     return clusters
+
+
+class StoreClusterReads:
+    """{cluster name: (positions, barcodes, CIGARs)} for kept TSS clusters, read from the read store on demand.
+
+    The cluster named 'gene*start_end' holds every read of the gene whose position lies in [start, end] (all-reads
+    clustering), so its reads are taken straight from the store -- nothing is held in memory between clusters.
+    """
+
+    def __init__(self, count_out_dir):
+        from .read_store import ReadStore, store_dir_of
+        self.store = ReadStore(store_dir_of(count_out_dir))
+
+    def __getitem__(self, name):
+        geneid, se = name.split('*')
+        start, end = (int(x) for x in se.split('_'))
+        pos, cb, cig = self.store.get(geneid)
+        m = (pos >= start) & (pos <= end)
+        return pos[m], self.store.barcodes[cb[m]], self.store.cigars[cig[m]]
+
+
+def cluster_reads_source(count_out_dir):
+    """Where CTSS gets each kept cluster's reads: the read store (runs made with the low-memory code), or keepdict.pkl
+    (output folders made by earlier versions of the fork)."""
+    from .read_store import has_store
+    if has_store(count_out_dir):
+        return StoreClusterReads(count_out_dir)
+    return load_kept_cluster_reads(count_out_dir)
 
 
 def pick_ctss(ctssls, minCTSSCount, minFC):
@@ -214,6 +242,6 @@ class get_CTSS_count():
         self.ctss_out_dir=os.path.join(self.out_dir+'/CTSS/')
         if not os.path.exists(self.ctss_out_dir):
             os.mkdir(self.ctss_out_dir)
-        clusters = load_kept_cluster_reads(os.path.join(self.out_dir, 'count'))
+        clusters = cluster_reads_source(os.path.join(self.out_dir, 'count'))
         return build_ctss_adata(clusters, self.alloneclusterdf, self.generefdf, self.windowSize,
                                 self.minCTSSCount, self.minFC, self.ctss_out_dir)
